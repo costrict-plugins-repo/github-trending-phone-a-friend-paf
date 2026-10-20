@@ -1,0 +1,1696 @@
+/**
+ * CLI entry point using Commander.js.
+ *
+ * Subcommands: relay (default), setup, doctor, config, plugin
+ * Backward compat aliases: install, update, uninstall
+ */
+
+import { resolve, dirname } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { Command } from 'commander';
+import ora from 'ora';
+import {
+  relay,
+  relayStream,
+  reviewRelay,
+  mergeObservers,
+  refuseUnsupportedRelaySession,
+  RelayError,
+} from './relay.js';
+import { theme, banner } from './theme.js';
+import {
+  REVIEW_SCOPES,
+  isReviewScope,
+  type ClaudePeerMessagingMode,
+  type ReviewScope,
+  type SandboxMode,
+} from './backends/index.js';
+import {
+  installHosts,
+  uninstallHosts,
+  verifyBackends,
+  isPluginInstalled,
+  installFromGitHubMarketplace,
+  InstallerError,
+} from './installer.js';
+import { setup } from './setup.js';
+import { doctor } from './doctor.js';
+import {
+  configInit,
+  configPaths,
+  configGet,
+  configSet,
+  loadConfig,
+  resolveConfig,
+  DEFAULT_CONFIG,
+} from './config.js';
+import { getVersion, getPackageRoot } from './version.js';
+import { parseVerdict, serializeVerdict, VerdictParseError } from './verdict.js';
+import { beginTrackedRun, describeRepo, type TrackedRun } from './task-tracking.js';
+import { TASK_STATUSES, type TaskEvent, type TaskRecord, type TaskStatus } from './tasks.js';
+import { createProgressReporter } from './progress.js';
+import { DEFAULT_RECENT_MINUTES, parseStatusLineStdin, statusLineForCwd } from './status-line.js';
+import {
+  buildSuppressionContext,
+  decideBanner,
+  defaultCachePath,
+  formatBanner,
+  kickoffBackgroundRefresh,
+  readSnapshot,
+  recordNotified,
+  runRefresh,
+  type BannerDecision,
+} from './updates.js';
+
+// ---------------------------------------------------------------------------
+// Repo root default
+// ---------------------------------------------------------------------------
+
+/** Commander accumulates repeated --context-file into an array; keep a single file as a string. */
+function normalizeContextFiles(value: string[] | undefined): string | string[] | null {
+  if (!value || value.length === 0) return null;
+  return value.length === 1 ? value[0] : value;
+}
+
+function repoRootDefault(): string {
+  return getPackageRoot();
+}
+
+// ---------------------------------------------------------------------------
+// Argv normalization (backward compatibility)
+// ---------------------------------------------------------------------------
+
+const KNOWN_SUBCOMMANDS = ['relay', 'install', 'update', 'uninstall', 'setup', 'doctor', 'config', 'plugin', 'agentic', 'job', 'session', 'task', '__update-check'];
+
+// Flags that Commander handles at the top level — never auto-route to relay
+const TOP_LEVEL_FLAGS = new Set(['-v', '-V', '--version', '-h', '--help']);
+
+function normalizeArgv(argv: string[]): string[] {
+  if (argv.length === 0) return argv;
+  const first = argv[0];
+  if (KNOWN_SUBCOMMANDS.includes(first)) {
+    return argv;
+  }
+  // Don't auto-route --help / --version to relay
+  if (TOP_LEVEL_FLAGS.has(first)) {
+    return argv;
+  }
+  if (first.startsWith('-')) {
+    return ['relay', ...argv];
+  }
+  return argv;
+}
+
+// ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
+
+// Task announcements go to stderr so stdout contracts (plain text, --schema,
+// --verdict-json) stay intact. The id is printed without styling so hosts can
+// match `Task <id> started` reliably.
+function announceTaskStart(tracked: TrackedRun): void {
+  if (!tracked.id) return;
+  process.stderr.write(`  ${theme.hint('◇')} Task ${tracked.id} started ${theme.hint(`· phone-a-friend task show ${tracked.id}`)}\n`);
+}
+
+function writeStderrLine(line: string): void {
+  process.stderr.write(`${line}\n`);
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Progress goes to stderr; in a TTY the spinner text is updated instead of printing lines. */
+function progressFor(spinner: { text: string } | null) {
+  return createProgressReporter({
+    write: writeStderrLine,
+    interactive: Boolean(process.stderr.isTTY),
+    spinner,
+  });
+}
+
+function readStdinNow(): string {
+  try {
+    return readFileSync(0, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function taskStatusLabel(status: TaskStatus): string {
+  switch (status) {
+    case 'completed': return theme.success('completed');
+    case 'running': return theme.info('running');
+    case 'failed': return theme.error('failed');
+    case 'interrupted': return theme.warning('interrupted');
+    default: return theme.hint('queued');
+  }
+}
+
+function formatTaskSummary(task: TaskRecord): string[] {
+  const lines: string[] = [];
+  lines.push(`  ${theme.bold(task.id)}  ${taskStatusLabel(task.status)}  ${theme.hint(timeSince(task.createdAt))}  ${theme.hint(`${task.backend} · ${task.kind}`)}`);
+  const head = task.headSha ? ` @ ${task.headSha.slice(0, 7)}` : '';
+  const where = task.branch ? `${task.repoPath} (${task.branch}${head})` : task.repoPath;
+  lines.push(`    ${theme.hint('repo:')} ${where}`);
+  if (task.kind === 'review') {
+    const drift = task.driftDetected === true
+      ? 'changed during review'
+      : task.driftDetected === false ? 'unchanged since start' : 'drift unknown';
+    const captured = task.diffFiles === null
+      ? 'scope not captured'
+      : `${task.diffFiles} file(s) · ${task.diffBytes ?? 0} bytes · ${drift}`;
+    const against = task.reviewBase ? ` against ${task.reviewBase}` : '';
+    lines.push(`    ${theme.hint('scope:')} ${task.reviewScope ?? 'branch'}${against} · ${captured}`);
+  }
+  if (task.backendSessionId) {
+    const label = task.sessionLabel ? ` (${task.sessionLabel})` : '';
+    lines.push(`    ${theme.hint('session:')} ${task.backendSessionId}${label}`);
+  }
+  if (task.host) lines.push(`    ${theme.hint('host:')} ${task.host}`);
+  if (task.promptPreview) lines.push(`    ${theme.hint('prompt:')} ${task.promptPreview}`);
+  if (task.status === 'completed') {
+    const result = task.result === null
+      ? 'not retained (task_history=metadata)'
+      : `${task.result.length} chars · phone-a-friend task result ${task.id}`;
+    lines.push(`    ${theme.hint('result:')} ${result}`);
+  }
+  if (task.error) lines.push(`    ${theme.hint('error:')} ${task.error}`);
+  return lines;
+}
+
+function formatTaskEvents(events: TaskEvent[]): string[] {
+  return events.map((event) => `    ${theme.hint(event.ts.slice(11, 19))}  ${event.type.padEnd(16)} ${event.message}`);
+}
+
+function timeSince(isoDate: string): string {
+  const seconds = Math.floor((Date.now() - new Date(isoDate).getTime()) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+function printBackendAvailability(): void {
+  console.log('\nBackend availability:');
+  for (const info of verifyBackends()) {
+    const mark = info.available ? '\u2713' : '\u2717';
+    const status = info.available ? 'available' : 'not found';
+    console.log(`  ${mark} ${info.name}: ${status}`);
+    if (!info.available && info.hint) {
+      console.log(`    Install: ${info.hint}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Install/update/uninstall action factories (shared by plugin + backward compat)
+// ---------------------------------------------------------------------------
+
+function resolveHostTarget(opts: {
+  claude?: boolean;
+  opencode?: boolean;
+  codex?: boolean;
+  pi?: boolean;
+  grok?: boolean;
+  all?: boolean;
+}): 'claude' | 'opencode' | 'codex' | 'pi' | 'grok' | 'all' {
+  if (opts.all) return 'all';
+  const selected = [opts.claude, opts.opencode, opts.codex, opts.pi, opts.grok].filter(Boolean).length;
+  if (selected > 1) {
+    throw new InstallerError(
+      'Multiple host flags cannot be combined. Pass --all to install every host, or pick one flag.',
+    );
+  }
+  if (opts.opencode) return 'opencode';
+  if (opts.codex) return 'codex';
+  if (opts.pi) return 'pi';
+  if (opts.grok) return 'grok';
+  return 'claude';
+}
+
+function installAction(opts: {
+  claude?: boolean;
+  opencode?: boolean;
+  codex?: boolean;
+  pi?: boolean;
+  grok?: boolean;
+  all?: boolean;
+  mode?: string;
+  force?: boolean;
+  repoRoot?: string;
+  claudeCliSync?: boolean;
+  codexCliSync?: boolean;
+  github?: boolean;
+  forceMarketplaceSync?: boolean;
+}): number {
+  if (opts.github) {
+    // Reject flags that don't apply to marketplace install
+    if (opts.mode && opts.mode !== 'symlink') {
+      console.error('Error: --mode is not compatible with --github');
+      return 1;
+    }
+    if (opts.repoRoot) {
+      console.error('Error: --repo-root is not compatible with --github');
+      return 1;
+    }
+    if (opts.opencode || opts.codex || opts.pi || opts.grok || opts.all) {
+      console.error(
+        'Error: --github only applies to Claude Code; OpenCode and Codex have no marketplace, ' +
+          'pi has its own package manager, and Grok installs skills into ~/.grok/skills. ' +
+          'Run `phone-a-friend plugin install --github` for Claude, then ' +
+          '`phone-a-friend plugin install --opencode`, `--codex`, `--pi`, and/or `--grok` separately.',
+      );
+      return 1;
+    }
+    // GitHub marketplace flow
+    const lines = ['phone-a-friend installer (GitHub marketplace)'];
+    lines.push(...installFromGitHubMarketplace());
+    for (const line of lines) console.log(line);
+    printBackendAvailability();
+    return 0;
+  }
+  // Existing local install flow
+  const target = resolveHostTarget(opts);
+  const lines = installHosts({
+    repoRoot: opts.repoRoot ?? repoRootDefault(),
+    target,
+    mode: (opts.mode ?? 'symlink') as 'symlink' | 'copy',
+    force: opts.force ?? false,
+    syncClaudeCli: opts.claudeCliSync !== false,
+    syncCodexCli: opts.codexCliSync !== false,
+    forceMarketplaceSync: opts.forceMarketplaceSync ?? false,
+  });
+  for (const line of lines) console.log(line);
+  printBackendAvailability();
+  return 0;
+}
+
+function updateAction(opts: {
+  claude?: boolean;
+  opencode?: boolean;
+  codex?: boolean;
+  pi?: boolean;
+  grok?: boolean;
+  all?: boolean;
+  mode?: string;
+  repoRoot?: string;
+  claudeCliSync?: boolean;
+  codexCliSync?: boolean;
+  forceMarketplaceSync?: boolean;
+}): void {
+  const target = resolveHostTarget(opts);
+  const lines = installHosts({
+    repoRoot: opts.repoRoot ?? repoRootDefault(),
+    target,
+    mode: (opts.mode ?? 'symlink') as 'symlink' | 'copy',
+    force: true,
+    syncClaudeCli: opts.claudeCliSync !== false,
+    syncCodexCli: opts.codexCliSync !== false,
+    forceMarketplaceSync: opts.forceMarketplaceSync ?? false,
+  });
+  for (const line of lines) console.log(line);
+  printBackendAvailability();
+}
+
+function uninstallAction(opts: {
+  claude?: boolean;
+  opencode?: boolean;
+  codex?: boolean;
+  pi?: boolean;
+  grok?: boolean;
+  all?: boolean;
+  purgeMarketplace?: boolean;
+  codexCliSync?: boolean;
+}): void {
+  const target = resolveHostTarget(opts);
+  const lines = uninstallHosts({
+    target,
+    repoRoot: repoRootDefault(),
+    claudeCliUnsync: opts.purgeMarketplace ? 'always' : 'auto',
+    codexCliUnsync: opts.codexCliSync === false ? 'never' : 'auto',
+  });
+  for (const line of lines) console.log(line);
+}
+
+// ---------------------------------------------------------------------------
+// Install/update/uninstall option helpers
+// ---------------------------------------------------------------------------
+
+function addInstallOptions(cmd: Command): Command {
+  return cmd
+    .option('--claude', 'Install for Claude', false)
+    .option('--opencode', 'Install for OpenCode', false)
+    .option('--codex', 'Install for Codex (skills under $CODEX_HOME plus marketplace registration)', false)
+    .option('--pi', 'Install for pi (skills under its agent directory, used as /skill:<name>)', false)
+    .option('--grok', 'Install for Grok (skills under ~/.grok/skills)', false)
+    .option('--all', 'Install for all supported hosts', false)
+    .option('--mode <mode>', 'Installation mode: symlink or copy', 'symlink')
+    .option('--force', 'Replace existing installation', false)
+    .option('--repo-root <path>', 'Repository root path')
+    .option('--no-claude-cli-sync', 'Skip Claude CLI sync')
+    .option('--no-codex-cli-sync', 'Skip Codex CLI sync (skip codex plugin marketplace add / plugin add)')
+    .option('--github', 'Register the Claude marketplace from GitHub, repointing a folder registration')
+    .option('--force-marketplace-sync', 'Repoint a Claude marketplace registered from another source (reinstalls PaF plugins)');
+}
+
+function addUpdateOptions(cmd: Command): Command {
+  return cmd
+    .option('--claude', 'Install for Claude', false)
+    .option('--opencode', 'Install for OpenCode', false)
+    .option('--codex', 'Install for Codex', false)
+    .option('--pi', 'Install for pi', false)
+    .option('--grok', 'Install for Grok', false)
+    .option('--all', 'Install for all supported hosts', false)
+    .option('--mode <mode>', 'Installation mode: symlink or copy', 'symlink')
+    .option('--repo-root <path>', 'Repository root path')
+    .option('--no-claude-cli-sync', 'Skip Claude CLI sync')
+    .option('--no-codex-cli-sync', 'Skip Codex CLI sync')
+    .option('--force-marketplace-sync', 'Repoint a Claude marketplace registered from another source (reinstalls PaF plugins)');
+}
+
+function addUninstallOptions(cmd: Command): Command {
+  return cmd
+    .option('--claude', 'Uninstall for Claude', false)
+    .option('--opencode', 'Uninstall for OpenCode', false)
+    .option('--codex', 'Uninstall for Codex', false)
+    .option('--pi', 'Uninstall for pi', false)
+    .option('--grok', 'Uninstall for Grok', false)
+    .option('--all', 'Uninstall for all supported hosts', false)
+    .option('--purge-marketplace', 'Also remove marketplace registration (even if installed remotely)')
+    .option('--no-codex-cli-sync', 'Skip codex plugin remove / marketplace remove during uninstall');
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+export async function run(argv: string[]): Promise<number> {
+  const normalized = normalizeArgv(argv);
+  let exitCode = 0;
+
+  // Update-check: read cache, decide banner, kick off background refresh.
+  // The banner (if any) is printed via the try/finally wrapping the main flow.
+  const updateState = setupUpdateCheck(normalized);
+
+  try {
+    return await runMain(normalized);
+  } finally {
+    if (updateState) maybeShowUpdateBanner(updateState);
+  }
+
+  async function runMain(normalized: string[]): Promise<number> {
+  if (normalized[0] === 'agentic' && normalized[1] === 'dashboard') {
+    console.error("error: unknown command 'dashboard'");
+    return 1;
+  }
+
+  // Smart no-args behavior
+  if (normalized.length === 0) {
+    const paths = configPaths();
+    const isFirstRun = !existsSync(paths.user);
+    const isTTY = process.stdout.isTTY && process.env.TERM !== 'dumb';
+
+    if (isTTY && isFirstRun) {
+      // First-run interactive menu
+      const { select } = await import('@inquirer/prompts');
+      console.log('');
+      console.log(banner('AI coding agent relay'));
+      console.log('');
+      console.log(`  ${theme.heading('Welcome!')} No configuration found yet.`);
+      console.log('');
+
+      const choice = await select({
+        message: 'What would you like to do?',
+        choices: [
+          { name: 'Run setup wizard (recommended)', value: 'setup' },
+          { name: 'Show quick start examples', value: 'quickstart' },
+          { name: 'Open TUI dashboard', value: 'tui' },
+          { name: 'Exit', value: 'exit' },
+        ],
+      });
+
+      if (choice === 'setup') {
+        await setup();
+        return 0;
+      }
+      if (choice === 'quickstart') {
+        console.log('');
+        console.log(`  ${theme.heading('Quick start')}`);
+        console.log('');
+        console.log(`  ${theme.hint('Relay a prompt to a backend:')}`);
+        console.log(`    ${theme.info('phone-a-friend --to codex --prompt "What does this project do?"')}`);
+        console.log('');
+        console.log(`  ${theme.hint('Stream tokens as they arrive:')}`);
+        console.log(`    ${theme.info('phone-a-friend --to claude --prompt "Review this code" --stream')}`);
+        console.log('');
+        console.log(`  ${theme.hint('Multi-agent session:')}`);
+        console.log(`    ${theme.info('phone-a-friend agentic run --agents reviewer:claude,critic:claude --prompt "Review auth"')}`);
+        console.log('');
+        console.log(`  ${theme.hint('Run setup anytime:')} ${theme.info('phone-a-friend setup')}`);
+        console.log('');
+        return 0;
+      }
+      if (choice === 'tui') {
+        const { renderTui } = await import('./tui/render.js');
+        return await renderTui();
+      }
+      // exit
+      return 0;
+    }
+
+    if (isTTY) {
+      // Config exists but plugin not installed: offer to reinstall
+      if (!isPluginInstalled()) {
+        const { select } = await import('@inquirer/prompts');
+        console.log('');
+        console.log(banner('AI coding agent relay'));
+        console.log('');
+        console.log(`  ${theme.warning('Claude plugin is not installed.')}`);
+        console.log('');
+
+        const choice = await select({
+          message: 'What would you like to do?',
+          choices: [
+            { name: 'Run setup wizard (installs plugin + configures backend)', value: 'setup' },
+            { name: 'Install plugin only', value: 'install' },
+            { name: 'Open TUI dashboard', value: 'tui' },
+            { name: 'Exit', value: 'exit' },
+          ],
+        });
+
+        if (choice === 'setup') {
+          await setup();
+          return 0;
+        }
+        if (choice === 'install') {
+          exitCode = installAction({ claude: true, force: true });
+          return 0;
+        }
+        if (choice === 'tui') {
+          const { renderTui } = await import('./tui/render.js');
+          return await renderTui();
+        }
+        return 0;
+      }
+
+      // Config exists + plugin installed: launch TUI directly
+      const { renderTui } = await import('./tui/render.js');
+      return await renderTui();
+    }
+
+    // Non-interactive: show setup nudge or help
+    if (isFirstRun) {
+      console.log('');
+      console.log(banner('AI coding agent relay'));
+      console.log('');
+      console.log(`  ${theme.warning('No backends configured yet.')}`);
+      console.log(`  Run ${theme.bold('phone-a-friend setup')} to get started.`);
+      console.log('');
+      console.log(`  ${theme.hint('Or jump straight in (requires codex in PATH):')}`);
+      console.log(`    ${theme.info('phone-a-friend --to codex --prompt "What does this project do?"')}`);
+      console.log('');
+      return 0;
+    }
+    // Config exists, non-TTY: fall through to Commander help
+  }
+
+  const program = new Command()
+    .name('phone-a-friend')
+    .version(`phone-a-friend ${getVersion()}`, '-v, --version')
+    .description('CLI relay for AI coding agent collaboration')
+    .addHelpText('before', `\n${banner('AI coding agent relay')}\n`)
+    .configureOutput({
+      writeOut: (str) => console.log(str.trimEnd()),
+      writeErr: (str) => console.error(str.trimEnd()),
+    })
+    .exitOverride();
+
+  // --- relay subcommand ---
+  program
+    .command('relay')
+    .description('Relay prompt/context to a coding backend (default)')
+    .option('--prompt <text>', 'Prompt to relay (required unless review mode is selected)')
+    .option('--to <backend>', 'Target backend: antigravity, codex, gemini, ollama, claude, opencode, pi, grok')
+    .option('--repo <path>', 'Repository path', process.cwd())
+    .option('--context-file <path>', 'File with additional context (repeat to attach several, in order)',
+      (value: string, previous: string[] | undefined) => [...(previous ?? []), value])
+    .option('--context-text <text>', 'Inline context text')
+    .option('--include-diff', 'Append git diff to prompt')
+    .option('--no-include-diff', 'Do not append git diff (overrides config defaults.include_diff)')
+    .option('--timeout <seconds>', 'Max runtime in seconds')
+    .option('--model <name>', 'Model override')
+    .option('--sandbox <mode>', 'Sandbox: read-only, workspace-write, danger-full-access')
+    .option('--peer-messaging <mode>', 'Claude peer messaging: native, accept, refuse')
+    .option('--schema <json>', 'Request structured JSON output matching this schema')
+    .option('--session <id>', 'Resume or create a persisted relay session (PaF label)')
+    .option('--backend-session <id>', 'Attach to a raw backend session/thread ID (bypasses PaF label store; combine with --session to adopt it)')
+    .option('--fast', 'Use fast mode when supported (--pure for OpenCode 1.x, -nc -ns for pi; no-op for Antigravity, Claude, Codex, Gemini, Ollama, and Grok)')
+    .option('--stream', 'Stream tokens as they arrive (default)')
+    .option('--no-stream', 'Disable streaming output (get full response at once)')
+    .option('--review', 'Use review mode (default scope: branch)')
+    .option('--review-scope <scope>', 'Review scope: branch, working-tree, all')
+    .option('--base <branch>', 'Base branch for review diff (default: auto-detect main/master)')
+    .option('--verdict-json', 'Review with opinionated verdict envelope (implies --review). Outputs compact JSON with verdict/findings/summary.')
+    .option('--quiet', 'Run silently, save result to job store')
+    .option('--no-task-history', 'Do not record this run in the local task store')
+    .action(async (opts, command) => {
+      // --base without --review implies review mode. So does --verdict-json.
+      const isReview = opts.review || opts.base !== undefined || opts.reviewScope !== undefined || opts.verdictJson;
+      const isVerdictJson = Boolean(opts.verdictJson);
+
+      if (opts.reviewScope !== undefined && !isReviewScope(opts.reviewScope)) {
+        console.error(
+          `  ${theme.crossmark} ${theme.error(`Invalid review scope: ${String(opts.reviewScope)}. Allowed values: ${REVIEW_SCOPES.join(', ')}`)}`,
+        );
+        exitCode = 1;
+        return;
+      }
+      const reviewScope = (opts.reviewScope ?? 'branch') as ReviewScope;
+
+      if (!opts.prompt && !isReview) {
+        console.error(`  ${theme.crossmark} ${theme.error('--prompt is required unless review mode is selected')}`);
+        exitCode = 1;
+        return;
+      }
+
+      if (isVerdictJson && opts.schema) {
+        console.error(`  ${theme.crossmark} ${theme.error('--verdict-json sets its own schema; do not combine with --schema')}`);
+        exitCode = 1;
+        return;
+      }
+
+      // Commander 15 no longer implicitly sets a default for paired flags: with both
+      // --include-diff and --no-include-diff registered, opts.includeDiff is undefined
+      // when neither is passed (Commander 14 defaulted it to true). Either way, use
+      // getOptionValueSource to distinguish "user explicitly passed a flag" (source
+      // 'cli') from an unset value, so absent CLI flags fall through to env/config.
+      const streamExplicit = command.getOptionValueSource('stream') === 'cli';
+      const includeDiffExplicit = command.getOptionValueSource('includeDiff') === 'cli';
+      const peerMessagingExplicit = command.getOptionValueSource('peerMessaging') === 'cli';
+      const taskHistoryExplicit = command.getOptionValueSource('taskHistory') === 'cli';
+
+      if (isReview && includeDiffExplicit && opts.includeDiff === true) {
+        console.error(
+          `  ${theme.crossmark} ${theme.error('--include-diff cannot be combined with review mode. Use --review-scope working-tree or --review-scope all.')}`,
+        );
+        exitCode = 1;
+        return;
+      }
+
+      // Resolve config: CLI flags > env vars > repo config > user config > defaults
+      const resolved = resolveConfig(
+        {
+          to: opts.to,
+          sandbox: opts.sandbox,
+          timeout: opts.timeout,
+          includeDiff: includeDiffExplicit ? String(opts.includeDiff) : undefined,
+          stream: streamExplicit ? String(opts.stream) : undefined,
+          model: opts.model,
+          base: opts.base,
+          peerMessaging: peerMessagingExplicit ? opts.peerMessaging : undefined,
+          taskHistory: taskHistoryExplicit && opts.taskHistory === false ? 'off' : undefined,
+        },
+        process.env,
+        opts.repo,
+      );
+
+      const backendName = resolved.backend;
+      const taskMode = resolved.taskHistory ?? 'results';
+      if (peerMessagingExplicit && backendName !== 'claude') {
+        throw new RelayError('--peer-messaging is only supported by the Claude backend');
+      }
+      const peerMessaging = backendName === 'claude'
+        ? resolved.claudePeerMessaging as ClaudePeerMessagingMode
+        : undefined;
+
+      if (isReview) {
+        // Reject unsupported sessions before recording a task, using the same
+        // capability check as relay. Supported sessions reach reviewRelay below.
+        refuseUnsupportedRelaySession(backendName, opts.session ?? null, opts.backendSession ?? null);
+        const tracked = beginTrackedRun({
+          mode: taskMode,
+          kind: 'review',
+          backend: backendName,
+          repoPath: opts.repo,
+          prompt: opts.prompt ?? null,
+          model: resolved.model ?? null,
+          sandbox: resolved.sandbox,
+          reviewScope,
+          reviewBase: opts.base ?? resolved.reviewBase ?? null,
+        });
+        announceTaskStart(tracked);
+        const baseLabel = opts.base ?? resolved.reviewBase ?? 'auto-detect';
+        const reviewTarget = reviewScope === 'working-tree'
+          ? 'working-tree changes'
+          : `${reviewScope} changes against ${baseLabel}`;
+        const spinner = isVerdictJson
+          ? null
+          : ora({
+              text: `Reviewing ${theme.bold(reviewTarget)} via ${theme.bold(backendName)}...`,
+              spinner: 'dots',
+              color: 'cyan',
+              stream: process.stderr,
+            }).start();
+        const progress = progressFor(spinner);
+
+        try {
+          const feedback = await reviewRelay({
+            repoPath: opts.repo,
+            backend: backendName,
+            base: opts.base ?? resolved.reviewBase,
+            scope: reviewScope,
+            prompt: opts.prompt,
+            timeoutSeconds: resolved.timeout,
+            model: resolved.model ?? null,
+            sandbox: resolved.sandbox as SandboxMode,
+            schema: opts.schema ?? null,
+            fast: Boolean(opts.fast),
+            verdictJson: isVerdictJson,
+            peerMessaging,
+            session: opts.session ?? null,
+            backendSession: opts.backendSession ?? null,
+            observer: mergeObservers(tracked.observer, progress.observer),
+          });
+          if (isVerdictJson) {
+            try {
+              const envelope = parseVerdict(feedback);
+              const serialized = serializeVerdict(envelope);
+              tracked.complete(serialized);
+              process.stdout.write(serialized + '\n');
+            } catch (err) {
+              if (err instanceof VerdictParseError) {
+                tracked.fail(new Error(`Verdict parse failed: ${err.message}`));
+                progress.finish({ taskId: tracked.id, status: 'failed', error: `Verdict parse failed: ${err.message}` });
+                process.stderr.write(
+                  `  ${theme.crossmark} ${theme.error('Verdict parse failed')}: ${err.message}\n` +
+                    `  ${theme.hint('Raw response (between markers):')}\n` +
+                    `<<<RAW_BEGIN\n${err.raw}\nRAW_END>>>\n`,
+                );
+                exitCode = 2;
+                return;
+              }
+              throw err;
+            }
+          } else {
+            tracked.complete(feedback);
+            spinner?.succeed(`${theme.bold(backendName)} reviewed`);
+            process.stdout.write(feedback + '\n');
+          }
+          progress.finish({ taskId: tracked.id, status: 'completed' });
+        } catch (err) {
+          tracked.fail(err);
+          spinner?.fail(`${theme.bold(backendName)} review failed`);
+          progress.finish({ taskId: tracked.id, status: 'failed', error: errorMessage(err) });
+          throw err;
+        }
+        return;
+      }
+
+      const tracked = beginTrackedRun({
+        mode: taskMode,
+        kind: 'relay',
+        backend: backendName,
+        repoPath: opts.repo,
+        prompt: opts.prompt ?? null,
+        model: resolved.model ?? null,
+        sandbox: resolved.sandbox,
+        sessionLabel: opts.session ?? null,
+      });
+      announceTaskStart(tracked);
+
+      const relayOpts = {
+        prompt: opts.prompt,
+        repoPath: opts.repo,
+        backend: backendName,
+        contextFile: normalizeContextFiles(opts.contextFile),
+        contextText: opts.contextText ?? null,
+        includeDiff: resolved.includeDiff,
+        timeoutSeconds: resolved.timeout,
+        model: resolved.model ?? null,
+        sandbox: resolved.sandbox as SandboxMode,
+        schema: opts.schema ?? null,
+        session: opts.session ?? null,
+        backendSession: opts.backendSession ?? null,
+        fast: Boolean(opts.fast),
+        peerMessaging,
+      };
+
+      const shouldStream = resolved.stream && !opts.schema && !opts.session && !opts.backendSession;
+
+      if (opts.quiet) {
+        const { relayBackground } = await import('./relay.js');
+        const { JobManager } = await import('./jobs.js');
+        const manager = new JobManager();
+        const progress = progressFor(null);
+        const { job, promise } = relayBackground({ ...relayOpts, observer: tracked.observer, jobManager: manager });
+        console.log(`  ${theme.success('\u2713')} ${theme.bold('Job started')} ${theme.info(job.id)}`);
+        console.log(`  ${theme.hint('Check status:')} phone-a-friend job status`);
+        console.log(`  ${theme.hint('Get result:')}  phone-a-friend job result ${job.id}`);
+        try {
+          await promise;
+        } catch {
+          // Error already recorded in job store by relayBackground()
+        }
+        const completed = manager.get(job.id);
+        if (completed?.status === 'completed') {
+          tracked.complete(completed.result ?? '');
+          console.log(`  ${theme.success('\u2713')} ${theme.bold('Done')} ${theme.info(job.id)}`);
+          if (opts.session) {
+            process.stderr.write(`  ${theme.hint('Session:')} ${theme.info(opts.session)}\n`);
+          }
+          progress.finish({ taskId: tracked.id, status: 'completed' });
+        } else {
+          const failure = completed?.error ?? `job ${completed?.status ?? 'unknown'}`;
+          tracked.fail(failure);
+          console.error(`  ${theme.crossmark} Job ${job.id} ${completed?.status ?? 'unknown'}: ${completed?.error ?? ''}`);
+          progress.finish({ taskId: tracked.id, status: 'failed', error: failure });
+          exitCode = 1;
+        }
+        return;
+      }
+
+      if (shouldStream) {
+        const spinner = ora({
+          text: `Relaying to ${theme.bold(backendName)}...`,
+          spinner: 'dots',
+          color: 'cyan',
+          stream: process.stderr,
+        }).start();
+
+        const progress = progressFor(spinner);
+        let firstChunk = true;
+        let hasOutput = false;
+        let collected = '';
+        try {
+          for await (const chunk of relayStream({ ...relayOpts, observer: mergeObservers(tracked.observer, progress.observer) })) {
+            if (firstChunk) {
+              spinner.stop();
+              firstChunk = false;
+            }
+            process.stdout.write(chunk);
+            collected += chunk;
+            hasOutput = true;
+          }
+          if (hasOutput) {
+            process.stdout.write('\n');
+          }
+          tracked.complete(collected);
+          process.stderr.write(`  ${theme.checkmark} ${theme.bold(backendName)} responded\n`);
+          progress.finish({ taskId: tracked.id, status: 'completed' });
+          if (opts.session) {
+            process.stderr.write(`  ${theme.hint('Session:')} ${theme.info(opts.session)}\n`);
+          }
+        } catch (err) {
+          tracked.fail(err);
+          if (firstChunk) {
+            spinner.fail(`${theme.bold(backendName)} failed`);
+          } else {
+            process.stderr.write(`\n  ${theme.crossmark} ${theme.error(`${backendName} stream error`)}\n`);
+          }
+          progress.finish({ taskId: tracked.id, status: 'failed', error: errorMessage(err) });
+          throw err;
+        }
+      } else {
+        const spinner = ora({
+          text: `Relaying to ${theme.bold(backendName)}...`,
+          spinner: 'dots',
+          color: 'cyan',
+          stream: process.stderr,
+        }).start();
+
+        const progress = progressFor(spinner);
+        try {
+          const feedback = await relay({ ...relayOpts, observer: mergeObservers(tracked.observer, progress.observer) });
+          tracked.complete(feedback);
+          spinner.succeed(`${theme.bold(backendName)} responded`);
+          process.stdout.write(feedback + '\n');
+          if (opts.session) {
+            process.stderr.write(`  ${theme.hint('Session:')} ${theme.info(opts.session)}\n`);
+          }
+          progress.finish({ taskId: tracked.id, status: 'completed' });
+        } catch (err) {
+          tracked.fail(err);
+          spinner.fail(`${theme.bold(backendName)} failed`);
+          progress.finish({ taskId: tracked.id, status: 'failed', error: errorMessage(err) });
+          throw err;
+        }
+      }
+    });
+
+  // --- setup subcommand ---
+  program
+    .command('setup')
+    .description('Interactive setup wizard')
+    .action(async () => {
+      await setup();
+    });
+
+  // --- doctor subcommand ---
+  program
+    .command('doctor')
+    .description('Health check all backends')
+    .option('--json', 'Output structured JSON', false)
+    .action(async (opts) => {
+      const result = await doctor({ json: opts.json, repoRoot: process.cwd() });
+      console.log(result.output);
+      exitCode = result.exitCode;
+    });
+
+  // --- config subcommand group ---
+  const configCmd = program
+    .command('config')
+    .description('Manage configuration');
+
+  configCmd
+    .command('init')
+    .description('Create default config file')
+    .option('--force', 'Overwrite existing config', false)
+    .action((opts) => {
+      const paths = configPaths(process.cwd());
+      configInit(paths.user, opts.force);
+      console.log(`Config created at ${paths.user}`);
+    });
+
+  configCmd
+    .command('show')
+    .description('Show resolved configuration')
+    .option('--sources', 'Show which file each value comes from', false)
+    .action((opts) => {
+      const config = loadConfig(process.cwd());
+      if (opts.sources) {
+        const paths = configPaths(process.cwd());
+        console.log(`User config: ${paths.user}`);
+        if (paths.repo) console.log(`Repo config: ${paths.repo}`);
+        console.log('');
+      }
+      console.log(JSON.stringify(config, null, 2));
+    });
+
+  configCmd
+    .command('paths')
+    .description('Print all config file paths')
+    .action(() => {
+      const paths = configPaths(process.cwd());
+      console.log(`User: ${paths.user}`);
+      if (paths.repo) {
+        console.log(`Repo: ${paths.repo}`);
+      } else {
+        console.log('Repo: (none)');
+      }
+    });
+
+  configCmd
+    .command('edit')
+    .description('Open user config in $EDITOR')
+    .action(() => {
+      const paths = configPaths(process.cwd());
+      const editorEnv = process.env.EDITOR ?? 'vi';
+      if (!existsSync(paths.user)) {
+        configInit(paths.user, true);
+      }
+      // Handle editors with args (e.g. "code -w", "nvim -u ...")
+      const parts = editorEnv.split(/\s+/);
+      spawnSync(parts[0], [...parts.slice(1), paths.user], { stdio: 'inherit' });
+    });
+
+  configCmd
+    .command('set <key> <value>')
+    .description('Set a config value (dot-notation)')
+    .action((key: string, value: string) => {
+      const paths = configPaths(process.cwd());
+      if (!existsSync(paths.user)) {
+        configInit(paths.user, true);
+      }
+      configSet(key, value, paths.user);
+      console.log(`Set ${key} = ${value}`);
+    });
+
+  configCmd
+    .command('get <key>')
+    .description('Get a config value')
+    .action((key: string) => {
+      const config = loadConfig(process.cwd());
+      const value = configGet(key, config);
+      if (value === undefined) {
+        console.log(`(not set)`);
+      } else {
+        console.log(String(value));
+      }
+    });
+
+  // --- plugin subcommand group ---
+  const pluginCmd = program
+    .command('plugin')
+    .description('Manage host integrations');
+
+  addInstallOptions(
+    pluginCmd
+      .command('install')
+      .description('Install as Claude Code plugin')
+  ).action((opts) => {
+    exitCode = installAction(opts);
+  });
+
+  addUpdateOptions(
+    pluginCmd
+      .command('update')
+      .description('Update Claude plugin')
+  ).action((opts) => updateAction(opts));
+
+  addUninstallOptions(
+    pluginCmd
+      .command('uninstall')
+      .description('Uninstall Claude plugin')
+  ).action((opts) => uninstallAction(opts));
+
+  // --- agentic subcommand group ---
+  const agenticCmd = program
+    .command('agentic')
+    .description('Multi-agent sessions with persistent agent-to-agent communication');
+
+  agenticCmd
+    .command('run', { isDefault: true })
+    .description('Start an agentic session')
+    .requiredOption('--agents <list>', 'Agent definitions: role:backend,... (e.g. security:claude,perf:claude)')
+    .requiredOption('--prompt <text>', 'Task prompt for the agents')
+    .option('--max-turns <n>', 'Maximum turns before forced stop', '20')
+    .option('--timeout <seconds>', 'Session timeout in seconds', '900')
+    .option('--repo <path>', 'Repository path', process.cwd())
+    .option('--sandbox <mode>', 'Sandbox mode', 'read-only')
+    .action(async (opts) => {
+      const { Orchestrator } = await import('./agentic/index.js');
+      const agents = parseAgentList(opts.agents);
+
+      if (agents.length === 0) {
+        console.error(`  ${theme.crossmark} ${theme.error('No agents specified. Use --agents role:backend,role:backend')}`);
+        exitCode = 1;
+        return;
+      }
+
+      const orchestrator = new Orchestrator();
+      const stop = () => orchestrator.stop();
+      process.on('SIGINT', stop);
+      process.on('SIGTERM', stop);
+
+      try {
+        const events = await orchestrator.run({
+          agents,
+          prompt: opts.prompt,
+          maxTurns: Number(opts.maxTurns),
+          timeoutSeconds: Number(opts.timeout),
+          repoPath: opts.repo,
+          sandbox: opts.sandbox,
+        });
+
+        if (await formatAgenticEvents(events)) exitCode = 1;
+      } finally {
+        await orchestrator.close();
+        process.off('SIGINT', stop);
+        process.off('SIGTERM', stop);
+      }
+    });
+
+  agenticCmd
+    .command('logs')
+    .description('View past agentic sessions')
+    .option('--session <id>', 'Show transcript for a specific session')
+    .action(async (opts) => {
+      const { TranscriptBus } = await import('./agentic/index.js');
+      const bus = new TranscriptBus();
+
+      try {
+        if (opts.session) {
+          const transcript = bus.getTranscript(opts.session);
+          const session = bus.getSession(opts.session);
+          if (!session) {
+            console.error(`  ${theme.crossmark} Session ${opts.session} not found`);
+            exitCode = 1;
+            return;
+          }
+          console.log(`\n  ${theme.heading('Session')} ${theme.info(session.id)}`);
+          console.log(`  ${theme.label('Prompt:')} ${session.prompt}`);
+          console.log(`  ${theme.label('Status:')} ${session.status}`);
+          console.log(`  ${theme.label('Agents:')} ${session.agents.map((a) => `${a.name}(${a.backend})`).join(', ')}`);
+          console.log(`  ${theme.label('Messages:')} ${transcript.length}`);
+          console.log('');
+          for (const msg of transcript) {
+            const time = msg.timestamp.toLocaleTimeString();
+            const arrow = theme.hint('→');
+            console.log(`  ${theme.hint(time)}  ${theme.bold(msg.from)} ${arrow} ${theme.bold(msg.to)}`);
+            console.log(`    ${msg.content.split('\n')[0].slice(0, 120)}`);
+          }
+          console.log('');
+        } else {
+          const sessions = bus.listSessions();
+          if (sessions.length === 0) {
+            console.log(`\n  ${theme.hint('No agentic sessions found.')}\n`);
+            return;
+          }
+          console.log(`\n  ${theme.heading('Agentic Sessions')}\n`);
+          for (const s of sessions) {
+            const status = s.status === 'completed' ? theme.success('✓')
+              : s.status === 'active' ? theme.info('●')
+              : s.status === 'failed' ? theme.error('✗')
+              : theme.warning('■');
+            const agents = s.agents.map((a) => `${a.name}(${a.backend})`).join(', ');
+            const time = s.createdAt.toLocaleString();
+            console.log(`  ${status} ${theme.bold(s.id)}  ${theme.hint(time)}`);
+            console.log(`    ${theme.hint(s.prompt.slice(0, 100))}`);
+            console.log(`    ${theme.hint(`Agents: ${agents}  |  Turns: ${s.turn}`)}`);
+            console.log('');
+          }
+        }
+      } finally {
+        bus.close();
+      }
+    });
+
+  agenticCmd
+    .command('replay')
+    .description('Replay a session transcript')
+    .requiredOption('--session <id>', 'Session ID to replay')
+    .action(async (opts) => {
+      const { TranscriptBus } = await import('./agentic/index.js');
+      const bus = new TranscriptBus();
+
+      try {
+        const session = bus.getSession(opts.session);
+        if (!session) {
+          console.error(`  ${theme.crossmark} Session ${opts.session} not found`);
+          exitCode = 1;
+          return;
+        }
+
+        const transcript = bus.getTranscript(opts.session);
+        console.log(`\n  ${theme.heading('Replay:')} ${theme.info(session.id)}`);
+        console.log(`  ${theme.label('Prompt:')} ${session.prompt}\n`);
+
+        let lastTurn = -1;
+        for (const msg of transcript) {
+          if (msg.turn !== lastTurn) {
+            console.log(`  ${theme.heading(`── Turn ${msg.turn} ──`)}`);
+            lastTurn = msg.turn;
+          }
+          const time = msg.timestamp.toLocaleTimeString();
+          const arrow = theme.hint('→');
+          console.log(`  ${theme.hint(time)}  ${theme.bold(msg.from)} ${arrow} ${theme.bold(msg.to)}`);
+          for (const line of msg.content.split('\n')) {
+            console.log(`    ${line}`);
+          }
+          console.log('');
+        }
+
+        console.log(`  ${theme.label('Status:')} ${session.status}  |  ${theme.label('Turns:')} ${session.turn}\n`);
+      } finally {
+        bus.close();
+      }
+    });
+
+  // --- job subcommand group ---
+  const jobCmd = program
+    .command('job')
+    .description('Manage background jobs');
+
+  jobCmd
+    .command('status')
+    .description('List background jobs')
+    .option('--json', 'Output as JSON', false)
+    .action(async (opts) => {
+      const { JobManager } = await import('./jobs.js');
+      const manager = new JobManager();
+      const jobs = manager.list();
+
+      if (opts.json) {
+        console.log(JSON.stringify(jobs, null, 2));
+        return;
+      }
+
+      if (jobs.length === 0) {
+        console.log(`\n  ${theme.hint('No background jobs.')}\n`);
+        return;
+      }
+
+      console.log(`\n  ${theme.heading('Background Jobs')}\n`);
+      for (const job of [...jobs].reverse()) {
+        const icon = job.status === 'completed' ? theme.success('done')
+          : job.status === 'running' ? theme.info('running')
+          : job.status === 'failed' ? theme.error('failed')
+          : job.status === 'cancelled' ? theme.warning('cancelled')
+          : theme.hint('pending');
+        const age = timeSince(job.createdAt);
+        console.log(`  ${theme.bold(job.id)}  ${icon}  ${theme.hint(age)}  ${theme.hint(job.backend)}`);
+        console.log(`    ${job.prompt.slice(0, 80)}${job.prompt.length > 80 ? '...' : ''}`);
+        if (job.progress) {
+          console.log(`    ${theme.hint(`Progress: ${job.progress}`)}`);
+        }
+      }
+      console.log('');
+    });
+
+  jobCmd
+    .command('result <id>')
+    .description('Show result of a completed job')
+    .action(async (id: string) => {
+      const { JobManager } = await import('./jobs.js');
+      const manager = new JobManager();
+      const job = manager.get(id);
+
+      if (!job) {
+        console.error(`  ${theme.crossmark} Job ${id} not found`);
+        exitCode = 1;
+        return;
+      }
+
+      if (job.status === 'completed' && job.result) {
+        process.stdout.write(job.result + '\n');
+      } else if (job.status === 'failed') {
+        console.error(`  ${theme.crossmark} Job failed: ${job.error ?? 'unknown error'}`);
+        exitCode = 1;
+      } else {
+        console.log(`  ${theme.hint(`Job ${id} is ${job.status}. No result yet.`)}`);
+      }
+    });
+
+  jobCmd
+    .command('cancel <id>')
+    .description('Cancel a running job')
+    .action(async (id: string) => {
+      const { JobManager } = await import('./jobs.js');
+      const manager = new JobManager();
+      const job = manager.get(id);
+
+      if (!job) {
+        console.error(`  ${theme.crossmark} Job ${id} not found`);
+        exitCode = 1;
+        return;
+      }
+
+      if (job.status !== 'running' && job.status !== 'pending') {
+        console.log(`  ${theme.hint(`Job ${id} is already ${job.status}.`)}`);
+        return;
+      }
+
+      if (job.pid) {
+        try {
+          process.kill(job.pid, 'SIGTERM');
+        } catch {
+          // Process may already be gone
+        }
+      }
+
+      manager.update(id, { status: 'cancelled' });
+      console.log(`  ${theme.success('\u2713')} Cancelled job ${theme.bold(id)}`);
+    });
+
+  // --- session subcommand group ---
+  const sessionCmd = program
+    .command('session')
+    .description('Manage persisted relay sessions');
+
+  sessionCmd
+    .command('list')
+    .description('List persisted relay sessions')
+    .option('--json', 'Output as JSON', false)
+    .action(async (opts) => {
+      const { SessionStore } = await import('./sessions.js');
+      const store = new SessionStore();
+      const sessions = store.list();
+
+      if (opts.json) {
+        console.log(JSON.stringify(sessions, null, 2));
+        return;
+      }
+
+      if (sessions.length === 0) {
+        console.log(`\n  ${theme.hint('No persisted sessions.')}\n`);
+        return;
+      }
+
+      console.log(`\n  ${theme.heading('Persisted Sessions')} ${theme.hint(`(${sessions.length})`)}\n`);
+      const sorted = [...sessions].sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+      for (const session of sorted) {
+        const age = timeSince(session.lastUsedAt);
+        const backendSid = session.backendSessionId ?? theme.hint('(none)');
+        console.log(`  ${theme.bold(session.id)}  ${theme.info(session.backend)}  ${theme.hint(age)}`);
+        console.log(`    ${theme.hint('backend session:')} ${backendSid}`);
+        console.log(`    ${theme.hint('repo:')} ${session.repoPath}`);
+        console.log(`    ${theme.hint('history:')} ${session.history.length} entries`);
+      }
+      console.log('');
+    });
+
+  sessionCmd
+    .command('delete <label>')
+    .description('Remove a persisted session by label')
+    .action(async (label: string) => {
+      const { SessionStore } = await import('./sessions.js');
+      const store = new SessionStore();
+      const removed = store.delete(label);
+      if (!removed) {
+        console.error(`  ${theme.crossmark} Session ${theme.bold(label)} not found`);
+        exitCode = 1;
+        return;
+      }
+      console.log(`  ${theme.success('\u2713')} Deleted session ${theme.bold(label)}`);
+    });
+
+  sessionCmd
+    .command('prune')
+    .description('Remove old sessions (default: older than 30 days)')
+    .option('--older-than <days>', 'Drop sessions whose lastUsedAt is older than N days', '30')
+    .option('--all', 'Drop every session', false)
+    .action(async (opts) => {
+      const { SessionStore } = await import('./sessions.js');
+      const store = new SessionStore();
+
+      if (opts.all) {
+        const count = store.clear();
+        console.log(`  ${theme.success('\u2713')} Removed ${theme.bold(String(count))} session${count === 1 ? '' : 's'}`);
+        return;
+      }
+
+      const days = Number(opts.olderThan);
+      if (!Number.isFinite(days) || days <= 0) {
+        console.error(`  ${theme.crossmark} --older-than must be a positive number of days, got "${opts.olderThan}"`);
+        exitCode = 1;
+        return;
+      }
+
+      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+      const removed = store.pruneOlderThan(cutoff);
+      if (removed.length === 0) {
+        console.log(`  ${theme.hint(`No sessions older than ${days} day${days === 1 ? '' : 's'}.`)}`);
+        return;
+      }
+      console.log(`  ${theme.success('\u2713')} Pruned ${theme.bold(String(removed.length))} session${removed.length === 1 ? '' : 's'} older than ${days} day${days === 1 ? '' : 's'}`);
+      for (const id of removed) {
+        console.log(`    ${theme.hint('-')} ${id}`);
+      }
+    });
+
+  // --- task subcommand group ---
+  const taskCmd = program
+    .command('task')
+    .description('Inspect tracked relays and reviews');
+
+  taskCmd
+    .command('list')
+    .description('List tracked tasks, newest first')
+    .option('--repo <path>', 'Only tasks for this repository (resolved to its worktree root)')
+    .option('--status <status>', `Filter by status: ${TASK_STATUSES.join(', ')}`)
+    .option('--limit <n>', 'Maximum number of tasks to show', '20')
+    .option('--json', 'Output as JSON', false)
+    .action(async (opts) => {
+      if (opts.status !== undefined && !TASK_STATUSES.includes(opts.status as TaskStatus)) {
+        console.error(`  ${theme.crossmark} Invalid status "${opts.status}". Allowed values: ${TASK_STATUSES.join(', ')}`);
+        exitCode = 1;
+        return;
+      }
+      const limit = Number(opts.limit);
+      if (!Number.isFinite(limit) || limit <= 0) {
+        console.error(`  ${theme.crossmark} --limit must be a positive number, got "${opts.limit}"`);
+        exitCode = 1;
+        return;
+      }
+      const { TaskStore } = await import('./tasks.js');
+      const store = new TaskStore();
+      try {
+        store.reconcileInterrupted();
+        const tasks = store.list({
+          repoPath: opts.repo ? describeRepo(opts.repo).root : undefined,
+          status: opts.status as TaskStatus | undefined,
+          limit,
+        });
+        if (opts.json) {
+          console.log(JSON.stringify(tasks, null, 2));
+          return;
+        }
+        if (tasks.length === 0) {
+          console.log(`\n  ${theme.hint('No tracked tasks.')}\n`);
+          return;
+        }
+        console.log(`\n  ${theme.heading('Tracked Tasks')} ${theme.hint(`(${tasks.length})`)}\n`);
+        for (const task of tasks) {
+          for (const line of formatTaskSummary(task)) console.log(line);
+        }
+        console.log('');
+      } finally {
+        store.close();
+      }
+    });
+
+  taskCmd
+    .command('show <id>')
+    .description('Show one task with its scope, session, and event log (id prefix accepted)')
+    .option('--json', 'Output as JSON', false)
+    .action(async (id: string, opts) => {
+      const { TaskStore } = await import('./tasks.js');
+      const store = new TaskStore();
+      try {
+        store.reconcileInterrupted();
+        const task = store.get(id);
+        if (!task) {
+          console.error(`  ${theme.crossmark} Task ${id} not found`);
+          exitCode = 1;
+          return;
+        }
+        const events = store.events(task.id);
+        if (opts.json) {
+          console.log(JSON.stringify({ task, events }, null, 2));
+          return;
+        }
+        console.log('');
+        for (const line of formatTaskSummary(task)) console.log(line);
+        if (events.length > 0) {
+          console.log(`\n  ${theme.heading('Events')}\n`);
+          for (const line of formatTaskEvents(events)) console.log(line);
+        }
+        console.log('');
+      } finally {
+        store.close();
+      }
+    });
+
+  taskCmd
+    .command('result <id>')
+    .description('Print the stored result of a completed task (exit 3 while it is still running)')
+    .action(async (id: string) => {
+      const { TaskStore } = await import('./tasks.js');
+      const store = new TaskStore();
+      try {
+        store.reconcileInterrupted();
+        const task = store.get(id);
+        if (!task) {
+          console.error(`  ${theme.crossmark} Task ${id} not found`);
+          exitCode = 1;
+          return;
+        }
+        if (task.status === 'completed') {
+          if (task.result === null) {
+            console.error(`  ${theme.hint(`Task ${task.id} completed, but its result was not retained (task_history=metadata).`)}`);
+            return;
+          }
+          process.stdout.write(task.result + '\n');
+          return;
+        }
+        if (task.status === 'failed' || task.status === 'interrupted') {
+          console.error(`  ${theme.crossmark} Task ${task.id} ${task.status}: ${task.error ?? 'no error recorded'}`);
+          exitCode = 1;
+          return;
+        }
+        console.error(`  ${theme.hint(`Task ${task.id} is ${task.status}; no result yet.`)}`);
+        exitCode = 3;
+      } finally {
+        store.close();
+      }
+    });
+
+  taskCmd
+    .command('status-line')
+    .description('One line for a Claude Code status line: the running or most recent task for the current repository (reads the status line JSON on stdin)')
+    .option('--repo <path>', 'Repository to report on (default: cwd from the stdin JSON, else the current directory)')
+    .option('--recent <minutes>', 'Also show tasks that finished within this many minutes', String(DEFAULT_RECENT_MINUTES))
+    .action(async (opts) => {
+      const recent = Number(opts.recent);
+      if (!Number.isFinite(recent) || recent < 0) {
+        console.error(`  ${theme.crossmark} --recent must be a non-negative number of minutes, got "${opts.recent}"`);
+        exitCode = 1;
+        return;
+      }
+      const stdin = process.stdin.isTTY ? '' : readStdinNow();
+      const cwd = opts.repo ?? parseStatusLineStdin(stdin).cwd ?? process.cwd();
+      const { TaskStore } = await import('./tasks.js');
+      const store = new TaskStore();
+      try {
+        const line = statusLineForCwd(store, cwd, new Date(), recent);
+        if (line) console.log(line);
+      } finally {
+        store.close();
+      }
+    });
+
+  taskCmd
+    .command('delete <id>')
+    .description('Remove one tracked task and its events')
+    .action(async (id: string) => {
+      const { TaskStore } = await import('./tasks.js');
+      const store = new TaskStore();
+      try {
+        const task = store.get(id);
+        if (!task || !store.delete(task.id)) {
+          console.error(`  ${theme.crossmark} Task ${id} not found`);
+          exitCode = 1;
+          return;
+        }
+        console.log(`  ${theme.success('✓')} Deleted task ${theme.bold(task.id)}`);
+      } finally {
+        store.close();
+      }
+    });
+
+  taskCmd
+    .command('prune')
+    .description('Remove old tasks (default: older than 30 days)')
+    .option('--older-than <days>', 'Drop tasks created more than N days ago', '30')
+    .option('--all', 'Drop every tracked task', false)
+    .action(async (opts) => {
+      const { TaskStore } = await import('./tasks.js');
+      const store = new TaskStore();
+      try {
+        if (opts.all) {
+          const count = store.clear();
+          console.log(`  ${theme.success('✓')} Removed ${theme.bold(String(count))} task${count === 1 ? '' : 's'}`);
+          return;
+        }
+        const days = Number(opts.olderThan);
+        if (!Number.isFinite(days) || days <= 0) {
+          console.error(`  ${theme.crossmark} --older-than must be a positive number of days, got "${opts.olderThan}"`);
+          exitCode = 1;
+          return;
+        }
+        const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+        const removed = store.pruneOlderThan(cutoff);
+        if (removed.length === 0) {
+          console.log(`  ${theme.hint(`No tasks older than ${days} day${days === 1 ? '' : 's'}.`)}`);
+          return;
+        }
+        console.log(`  ${theme.success('✓')} Pruned ${theme.bold(String(removed.length))} task${removed.length === 1 ? '' : 's'} older than ${days} day${days === 1 ? '' : 's'}`);
+      } finally {
+        store.close();
+      }
+    });
+
+  // --- Internal: detached update-check refresh ---
+  // Hidden subcommand spawned by the parent process to fetch the npm registry's
+  // dist-tags.latest and update the local cache. Not user-facing.
+  program
+    .command('__update-check <action>', { hidden: true })
+    .description('(internal) refresh update-check cache')
+    .action(async (action: string) => {
+      if (action === 'refresh') {
+        try {
+          await runRefresh({
+            cachePath: defaultCachePath(),
+            currentVersion: getVersion(),
+          });
+        } catch {
+          // Detached child: never throw, never log to user terminal.
+        }
+      }
+    });
+
+  // --- Backward compat aliases ---
+  addInstallOptions(
+    program
+      .command('install')
+      .description('Install Claude plugin (alias for: plugin install)')
+  ).action((opts) => {
+    exitCode = installAction(opts);
+  });
+
+  addUpdateOptions(
+    program
+      .command('update')
+      .description('Update Claude plugin (alias for: plugin update)')
+  ).action((opts) => updateAction(opts));
+
+  addUninstallOptions(
+    program
+      .command('uninstall')
+      .description('Uninstall Claude plugin (alias for: plugin uninstall)')
+  ).action((opts) => uninstallAction(opts));
+
+  try {
+    await program.parseAsync(normalized, { from: 'user' });
+  } catch (err) {
+    if (err instanceof RelayError || err instanceof InstallerError) {
+      console.error('');
+      console.error(`  ${theme.crossmark} ${theme.error(err.message)}`);
+      if (err.message.includes('too large')) {
+        console.error(`  ${theme.hint('Try reducing the size of your input or context.')}`);
+      }
+      if (err.message.includes('depth limit')) {
+        console.error(`  ${theme.hint('Agents are calling each other recursively.')}`);
+      }
+      console.error('');
+      return 1;
+    }
+    // Commander throws CommanderError for --help, --version, parse errors
+    if (err && typeof err === 'object' && 'exitCode' in err) {
+      return (err as { exitCode: number }).exitCode;
+    }
+    if (err instanceof Error) {
+      console.error(err.message);
+      return 1;
+    }
+    throw err;
+  }
+
+  return exitCode;
+  } // end of runMain
+}
+
+// ---------------------------------------------------------------------------
+// Update-check helpers (notification only, npm registry dist-tags.latest)
+// ---------------------------------------------------------------------------
+
+interface UpdateCheckState {
+  cachePath: string;
+  currentVersion: string;
+  snapshot: ReturnType<typeof readSnapshot>;
+  decision: BannerDecision;
+}
+
+function setupUpdateCheck(argv: string[]): UpdateCheckState | null {
+  // Recursion guard: the detached child process is invoked with this env var
+  // set so it skips its own update-check setup. Without this, we'd fork-bomb.
+  if (process.env.PHONE_A_FRIEND_UPDATE_REFRESH === '1') return null;
+
+  // Skip for the internal subcommand itself.
+  if (argv[0] === '__update-check') return null;
+
+  const currentVersion = getVersion();
+  if (currentVersion === 'unknown') return null;
+
+  // Cheap config read — keeps this synchronous so we can stay out of run()'s async path.
+  // Pass cwd so repo-level `.phone-a-friend.toml` can disable update_check
+  // alongside (or in place of) the user-level config.
+  let configEnabled = true;
+  try {
+    const cfg = loadConfig(process.cwd());
+    configEnabled = cfg.defaults?.update_check !== false;
+  } catch {
+    // Config errors should never block the user's command. Fall back to enabled.
+  }
+
+  const ctx = buildSuppressionContext(argv, configEnabled);
+
+  // Hard skip: never touch disk or network when the user has explicitly opted
+  // out, or in CI environments where banners are useless and registry traffic
+  // is wasteful (CI runs frequently).
+  if (ctx.envOptedOut || !ctx.configEnabled || ctx.isCi) {
+    return null;
+  }
+
+  const cachePath = defaultCachePath();
+  const snapshot = readSnapshot(cachePath, currentVersion);
+
+  // Kick off the background refresh regardless of whether we'll display a
+  // banner this run — the cache update powers the *next* interactive run, even
+  // when this invocation is piped or scripted.
+  kickoffBackgroundRefresh({ cachePath, currentVersion, snapshot });
+
+  // The banner gates (TTY, machine-readable flags, dumb term, cooldown) live
+  // inside decideBanner. Keep the rest of setup unconditional so the cache
+  // gets populated.
+  const decision = decideBanner(snapshot, currentVersion, ctx, Date.now());
+
+  return { cachePath, currentVersion, snapshot, decision };
+}
+
+function maybeShowUpdateBanner(state: UpdateCheckState): void {
+  if (!state.decision.show) return;
+  const { currentVersion: cur, latestVersion: latest } = state.decision;
+  // Stderr only — never contaminate stdout (already gated by hasMachineFlag /
+  // TTY checks, but defense in depth).
+  process.stderr.write(formatBanner(cur, latest));
+  recordNotified({
+    cachePath: state.cachePath,
+    snapshot: state.snapshot,
+    notifiedVersion: latest,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Agentic helpers
+// ---------------------------------------------------------------------------
+
+function parseAgentList(input: string): Array<{ name: string; backend: string; model?: string }> {
+  return input.split(',').map((pair) => {
+    const parts = pair.trim().split(':');
+    if (parts.length < 2) return null;
+    return {
+      name: parts[0],
+      backend: parts[1],
+      model: parts[2] || undefined,
+    };
+  }).filter((a): a is NonNullable<typeof a> => a !== null);
+}
+
+async function formatAgenticEvents(events: AsyncIterable<import('./agentic/events.js').AgenticEvent>): Promise<boolean> {
+  let failed = false;
+  for await (const event of events) {
+    const time = new Date().toLocaleTimeString();
+
+    switch (event.type) {
+      case 'session_start':
+        console.log(`\n  ${theme.heading('Agentic Session')} ${theme.info(event.sessionId)}`);
+        console.log(`  ${theme.label('Prompt:')} ${event.prompt}`);
+        console.log(`  ${theme.label('Agents:')} ${event.agents.map((a) => `${theme.bold(a.name)}(${a.backend})`).join(', ')}\n`);
+        break;
+      case 'message': {
+        const arrow = theme.hint('→');
+        console.log(`  ${theme.hint(time)}  ${theme.bold(event.from)} ${arrow} ${theme.bold(event.to)}`);
+        const lines = event.content.split('\n').slice(0, 3);
+        for (const line of lines) {
+          console.log(`    ${line}`);
+        }
+        if (event.content.split('\n').length > 3) {
+          console.log(`    ${theme.hint(`... (${event.content.split('\n').length - 3} more lines)`)}`);
+        }
+        break;
+      }
+      case 'agent_status': {
+        const icon = event.status === 'active' ? theme.info('●')
+          : event.status === 'idle' ? theme.hint('○')
+          : theme.error('✗');
+        console.log(`  ${theme.hint(time)}  ${icon} ${event.agent}: ${event.status}`);
+        break;
+      }
+      case 'turn_complete':
+        console.log(`  ${theme.hint(`── Turn ${event.turn} complete (${event.pendingCount} pending) ──`)}`);
+        break;
+      case 'guardrail':
+        console.log(`  ${theme.warning('⚠')} ${theme.warning(event.guard)}: ${event.detail}`);
+        break;
+      case 'session_end': {
+        if (event.reason !== 'converged') failed = true;
+        const elapsed = (event.elapsed / 1000).toFixed(1);
+        console.log(`\n  ${theme.heading('Session ended')}: ${event.reason}`);
+        console.log(`  ${theme.label('Turns:')} ${event.turn}  |  ${theme.label('Elapsed:')} ${elapsed}s\n`);
+        break;
+      }
+      case 'error': {
+        failed = true;
+        const prefix = event.agent ? `${event.agent}: ` : '';
+        console.error(`  ${theme.crossmark} ${theme.error(`${prefix}${event.error}`)}`);
+        break;
+      }
+    }
+  }
+  return failed;
+}

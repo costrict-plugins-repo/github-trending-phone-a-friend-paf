@@ -1,0 +1,957 @@
+/**
+ * File-content invariants for the canonical skills and host command shims.
+ *
+ * These are not unit tests of code paths — they pin the *content contract*
+ * that Claude and OpenCode rely on. If someone strips Claude's Agent Teams
+ * primitives out of commands/phone-a-team.md again, accidentally
+ * resurrects an OpenCode phone-a-team skill, or thins out the rich Claude
+ * command files back into shims, the regression is caught here before it
+ * reaches a host.
+ */
+
+import { describe, it, expect } from 'vitest';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { load } from 'js-yaml';
+
+const REPO = join(__dirname, '..');
+
+function readFile(rel: string): string {
+  return readFileSync(join(REPO, rel), 'utf-8');
+}
+
+function parseFrontmatter(raw: string): unknown {
+  const match = raw.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) throw new Error('no frontmatter');
+  return load(match[1]);
+}
+
+/**
+ * The version-tolerant probe pattern that gates --no-include-diff.
+ * Any file that issues binary-mode relays must carry this probe (verbatim
+ * `relay --help`, NOT bare `--help`, because top-level help does not list
+ * relay flags). Pinning this guards against:
+ * - regressions to a bare `--help` probe (would always fall back to env var)
+ * - silent removal of the env-var fallback (would hard-fail on stale binaries)
+ */
+const PROBE = "phone-a-friend relay --help 2>/dev/null | grep -q -- '--no-include-diff'";
+const ENV_FALLBACK = 'PHONE_A_FRIEND_INCLUDE_DIFF=false';
+
+describe('Claude /phone-a-team rich command (commands/phone-a-team.md)', () => {
+  const file = readFile('commands/phone-a-team.md');
+
+  it('declares phone-a-team in frontmatter', () => {
+    expect(file).toMatch(/^---\nname: phone-a-team\n/);
+  });
+
+  it('uses current Agent Teams mechanics: named Agent spawns, SendMessage, no TeamCreate/TeamDelete', () => {
+    // Claude Code 2.1.178 removed TeamCreate/TeamDelete. A teammate now
+    // launches when the Agent tool is called with a `name` while
+    // CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1, and cleanup is automatic.
+    expect(file).toContain('CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS');
+    expect(file).toMatch(/Agent tool[^\n]*`name`/);
+    expect(file).toContain('SendMessage');
+    expect(file).not.toContain('TeamCreate');
+    expect(file).not.toContain('TeamDelete');
+    expect(file).not.toContain('shutdown_request');
+    expect(file).not.toContain('team_name');
+    expect(file).not.toContain('bypassPermissions');
+  });
+
+  it('documents the teammate limitations that matter for relays', () => {
+    // Teammates cannot run background Bash and non-interactive sessions never spawn them.
+    expect(file).toMatch(/cannot run (a )?background Bash/i);
+    expect(file).toMatch(/teammateMode/);
+  });
+
+  it('supports --backend antigravity, opencode, and all alongside the legacy values', () => {
+    expect(file).toMatch(/--backend antigravity\|codex\|gemini\|ollama\|opencode\|both\|all/);
+    expect(file).toContain('### Backend selection for `--backend all`');
+  });
+
+  it('uses the version-tolerant probe and env-var fallback', () => {
+    expect(file).toContain(PROBE);
+    expect(file).toContain(ENV_FALLBACK);
+    // Must reference the gate variable in worker/lead command templates.
+    expect(file).toContain('$PAF_NO_DIFF');
+  });
+
+  it('records convergence trace entries with the verdict-json envelope shape', () => {
+    expect(file).toContain('CONVERGENCE_TRACE = []');
+    expect(file).toContain('"schema_version": 1');
+    expect(file).toContain('same shape used by `phone-a-friend --verdict-json`');
+    expect(file).not.toMatch(/"round":\s*<int/);
+  });
+
+  it('keeps backend-judged verdicts from downgrading lead-found blockers', () => {
+    expect(file).toContain('merge it conservatively with');
+    expect(file).toMatch(
+      /any blocker or important finding from either\s+source makes the trace verdict `iterate`/,
+    );
+    expect(file).toContain('MUST NOT erase blocker or important findings the lead already found');
+  });
+
+  it('uses only defined max-rounds variables in the retrospective', () => {
+    expect(file).toMatch(/one-based round\s+number `K`/);
+    expect(file).toContain('K < MAX_ROUNDS');
+    expect(file).not.toContain('Call that index `K`');
+    expect(file).not.toContain('MAX_ROUNDS_REQUESTED');
+  });
+
+  it('forbids invalid CLI shapes', () => {
+    expect(file).toContain('phone-a-friend phone-a-team');
+    expect(file).toContain('--to codex,gemini');
+    expect(file).toMatch(/`--backend`[^\n]*not a PaF flag/);
+  });
+
+  it('uses native Agent Teams shutdown semantics', () => {
+    expect(file).toContain('shutdown_approved');
+    expect(file).toContain('Do NOT poll `~/.claude/teams/<team-name>/`');
+    expect(file).toContain('Do not use Bash `ls`, `grep`,');
+    expect(file).toContain('only cleanup wait allowed');
+    expect(file).toContain('successful cleanup must be followed immediately by final text');
+    expect(file).not.toContain('shutdown_response');
+  });
+
+  it('instructs workers to exit after approving shutdown', () => {
+    // Belt-and-suspenders for models that interpret "approve" as plain-text "OK".
+    // Without an explicit exit instruction, a teammate could acknowledge and hang.
+    // Asserts the phrase appears in BOTH WORKER blocks (helper-mode + direct-mode);
+    // a regression that loses one block would otherwise pass with a single occurrence.
+    const occurrences = file.match(/exit your process/g) ?? [];
+    expect(occurrences.length).toBe(2);
+    expect(file).toContain('stay active waiting for follow-up');
+    expect(file).toContain('shutdown response unless explicitly recovering');
+  });
+});
+
+describe('Claude /phone-a-friend rich command (commands/phone-a-friend.md)', () => {
+  const file = readFile('commands/phone-a-friend.md');
+
+  it('declares phone-a-friend in frontmatter with argument-hint', () => {
+    expect(file).toMatch(/^---\nname: phone-a-friend\n/);
+    expect(parseFrontmatter(file)).toMatchObject({ 'argument-hint': '[optional review focus]' });
+    expect(file).toMatch(/description:[^\n]*OpenCode/);
+  });
+
+  it('contains the rich workflow (not a thin shim)', () => {
+    // The previous regression replaced this file with a 22-line shim that
+    // delegated to the skill. The rich workflow includes these section
+    // headings; together they are infeasible to fit in a shim.
+    expect(file).toContain('## Workflow');
+    expect(file).toContain('## Session continuity');
+    expect(file).toContain('## Speed optimization');
+    expect(file).toContain('Direct call reference');
+    // Length floor: the rich command is ~250 lines; a shim was ~22.
+    const lineCount = file.split('\n').length;
+    expect(lineCount).toBeGreaterThan(150);
+  });
+
+  it('does not pin Gemini to a specific model (priority list removed)', () => {
+    // The "Gemini Model Priority" section was removed: PaF now lets
+    // Gemini's auto-routing pick the default model, with the dead-model
+    // cache surfacing clear errors when explicit pins 404. Aligning
+    // Gemini examples with Claude/Codex (no --model by default).
+    expect(file).not.toContain('## Gemini Model Priority');
+    expect(file.toLowerCase()).not.toContain('gemini model priority');
+    // No example command should pin --model gemini-2.5-flash.
+    expect(file).not.toMatch(/--model\s+gemini-2\.5-flash\b/);
+  });
+
+  it('uses the version-tolerant probe and env-var fallback', () => {
+    expect(file).toContain(PROBE);
+    expect(file).toContain(ENV_FALLBACK);
+    expect(file).toContain('$PAF_NO_DIFF');
+  });
+
+  it('does not hardcode a single backend in its example commands', () => {
+    // The shim regression hardcoded `--to codex` in the only example.
+    // Rich content shows multiple backends so the model routes by intent.
+    expect(file).toContain('--to antigravity');
+    expect(file).toContain('--to gemini');
+    expect(file).toContain('--to codex');
+  });
+
+  it('does not frame Claude content as OpenCode-conditional', () => {
+    // The shim heading "Execution constraints when running from OpenCode"
+    // weakened the rules for Claude users. Rich content uses host-neutral
+    // framing.
+    expect(file).not.toContain('when running from OpenCode');
+  });
+
+  it('documents intentional Claude cross-session messaging', () => {
+    expect(file).toContain('## Claude cross-session messaging');
+    expect(file).toContain('--peer-messaging accept');
+    expect(file).toContain("Claude's `ListAgents` and `SendMessage` tools");
+    expect(file).toContain('backends.claude.peer_messaging accept');
+    expect(file).toContain('one-shot relays appear as\n`paf-relay`');
+  });
+
+  it('routes Claude-host reviews through the paf-reviewer subagent with a Bash fallback', () => {
+    expect(file).toContain('phone-a-friend:paf-reviewer');
+    expect(file).toContain('run_in_background');
+    expect(file).toMatch(/do not (give it a|pass a)\s+`name`/i);
+  });
+
+  it('does not direct-mode-leak PaF-only flags', () => {
+    // PaF flags (--no-include-diff, --fast, --session) only exist on the
+    // `phone-a-friend` binary. They must not appear in direct-mode codex/
+    // gemini templates.
+    expect(file).toMatch(/`--no-include-diff`[^\n]*only available in binary mode|do NOT pass PaF flags|only available in binary mode/);
+  });
+});
+
+describe('paf-reviewer plugin subagent (agents/paf-reviewer.md)', () => {
+  const file = readFile('agents/paf-reviewer.md');
+  const fm = parseFrontmatter(file) as Record<string, unknown>;
+
+  it('declares a background subagent with a narrow tool set', () => {
+    expect(fm.name).toBe('paf-reviewer');
+    expect(String(fm.description)).toMatch(/phone-a-friend/);
+    expect(fm.background).toBe(true);
+    expect(String(fm.tools).split(/,\s*/).sort()).toEqual(['Bash', 'Read']);
+  });
+
+  it('runs exactly one PaF command and reports receipt, verbatim findings, next action', () => {
+    expect(file).toMatch(/exactly one PaF\s+command/);
+    expect(file).toContain('never append `--include-diff`');
+    expect(file).toContain('**Receipt**');
+    expect(file).toContain('**Findings**');
+    expect(file).toContain('**Next action**');
+    expect(file).toContain('phone-a-friend task result <id>');
+    expect(file).toMatch(/Trust the `Task <id> completed\|failed`/);
+  });
+
+  it('ships in the npm package', () => {
+    const pkg = JSON.parse(readFile('package.json')) as { files: string[] };
+    expect(pkg.files).toContain('agents/');
+  });
+});
+
+describe('Claude /curiosity-engine rich command (commands/curiosity-engine.md)', () => {
+  const file = readFile('commands/curiosity-engine.md');
+
+  it('declares curiosity-engine in frontmatter with argument-hint', () => {
+    expect(file).toMatch(/^---\nname: curiosity-engine\n/);
+    // Quoted to keep Codex's strict YAML parser happy; tolerate optional quotes.
+    expect(file).toMatch(/argument-hint:\s*['"]?--topic/);
+  });
+
+  it('contains the full Q&A protocol (not a thin shim)', () => {
+    // Without these, the slash command is nonfunctional as a curiosity rally.
+    expect(file).toContain('ANSWER:');
+    expect(file).toContain('QUESTION:');
+    expect(file).toContain('## Step 3 — Serve Round 1');
+    expect(file).toContain('## Step 4 — Parse Backend Response');
+    expect(file).toContain('## Step 6 — Final Synthesis');
+    // Length floor: the rich command is ~350 lines; a shim was ~13.
+    const lineCount = file.split('\n').length;
+    expect(lineCount).toBeGreaterThan(200);
+  });
+
+  it('uses the version-tolerant probe and env-var fallback', () => {
+    // Curiosity-engine had ZERO --no-include-diff references before the fix.
+    // This test pins the suppression now in place.
+    expect(file).toContain(PROBE);
+    expect(file).toContain(ENV_FALLBACK);
+    expect(file).toContain('$PAF_NO_DIFF');
+  });
+
+  it('gates every binary-mode relay invocation with $PAF_NO_DIFF', () => {
+    // Find all binary-mode relay invocations (lines starting with
+    // `phone-a-friend --to <BACKEND>`). Each should reference the gate.
+    const lines = file.split('\n');
+    const relayLines = lines.filter(line =>
+      /^\s*phone-a-friend --to <BACKEND>/.test(line) ||
+      /^\s*phone-a-friend --to gemini\b/.test(line)
+    );
+    expect(relayLines.length).toBeGreaterThan(0);
+    for (const line of relayLines) {
+      expect(line).toContain('$PAF_NO_DIFF');
+    }
+  });
+
+  it('does not pin Gemini to a specific model (priority list removed)', () => {
+    // Same redesign as commands/phone-a-friend.md: no --model pin in examples.
+    expect(file).not.toContain('## Gemini Model Priority');
+    expect(file.toLowerCase()).not.toContain('gemini model priority');
+    expect(file).not.toMatch(/--model\s+gemini-2\.5-flash\b/);
+  });
+
+  it('allows Antigravity as a read-only rally backend', () => {
+    expect(file).toContain('antigravity|codex|gemini|ollama');
+    expect(file).toContain('command -v agy');
+    expect(file).toContain('Antigravity CLI not found');
+  });
+});
+
+describe('phone-a-team skill is Claude+Codex only (not OpenCode)', () => {
+  // /phone-a-team is supported on Claude (via commands/phone-a-team.md +
+  // TeamCreate/Task/SendMessage) and Codex (via the .codex/ overlay that
+  // spawns paf-* subagents). OpenCode has no Agent Teams primitive and no
+  // subagent primitive comparable to Codex's, so we deliberately do NOT
+  // ship a host-neutral skills/phone-a-team/SKILL.md or a COMMAND.opencode.md
+  // overlay. Lock that out at the file-tree level.
+
+  it('has no host-neutral skills/phone-a-team/SKILL.md', () => {
+    expect(existsSync(join(REPO, 'skills/phone-a-team/SKILL.md'))).toBe(false);
+  });
+
+  it('has no skills/phone-a-team/COMMAND.opencode.md overlay', () => {
+    expect(existsSync(join(REPO, 'skills/phone-a-team/COMMAND.opencode.md'))).toBe(false);
+  });
+
+  it('does ship the Codex overlay at skills/phone-a-team/.codex/SKILL.md', () => {
+    expect(existsSync(join(REPO, 'skills/phone-a-team/.codex/SKILL.md'))).toBe(true);
+  });
+});
+
+describe('Phone-a-friend skill (skills/phone-a-friend/SKILL.md)', () => {
+  const file = readFile('skills/phone-a-friend/SKILL.md');
+
+  it('frontmatter description lists every repo-aware CLI backend', () => {
+    expect(file).toMatch(/description:[^\n]*Antigravity/);
+    expect(file).toMatch(/description:[^\n]*OpenCode/);
+  });
+
+  it('uses the version-tolerant probe and env-var fallback', () => {
+    expect(file).toContain(PROBE);
+    expect(file).toContain(ENV_FALLBACK);
+    expect(file).toContain('$PAF_NO_DIFF');
+  });
+
+  it('forbids comma-separated --to and PaF subcommand shapes', () => {
+    expect(file).toContain('comma-separated');
+    expect(file).toContain('phone-a-friend phone-a-team');
+  });
+
+  it('prescribes PHONE_A_FRIEND_HOST=opencode for OpenCode invocations', () => {
+    expect(file).toContain('PHONE_A_FRIEND_HOST=opencode');
+  });
+
+  it('"from OpenCode" example uses env-var, not the probe gate', () => {
+    // The shim delegates into this skill. If a small model loads the skill
+    // and copies the "from OpenCode" example verbatim, the example MUST
+    // use PHONE_A_FRIEND_INCLUDE_DIFF=false (universal across binaries),
+    // NOT $PAF_NO_DIFF (requires the probe to be run first — which small
+    // models skip, see the OpenCode smoke test history).
+    //
+    // Locate the "For example, from OpenCode" code fence and check it.
+    const match = file.match(/For example, from OpenCode:\s*\n\s*```bash\n([\s\S]*?)\n```/);
+    expect(match).toBeTruthy();
+    const example = match![1];
+    expect(example).toContain('PHONE_A_FRIEND_HOST=opencode');
+    expect(example).toContain('PHONE_A_FRIEND_INCLUDE_DIFF=false');
+    expect(example).not.toContain('$PAF_NO_DIFF');
+    expect(example).not.toMatch(/(?<!`)--no-include-diff/);
+  });
+
+  it('explicitly tells OpenCode users NOT to use the probe-and-gate pattern', () => {
+    // Without this, small host models reading the rich workflow's probe
+    // section may copy that pattern back into their relays and re-introduce
+    // the smoke-test failure. Pin a host-aware steer.
+    // (\s allows the prose line wrap between `$PAF_NO_DIFF` and "from OpenCode".)
+    expect(file).toMatch(/Do (?:NOT|not) use[\s\S]{0,60}\$PAF_NO_DIFF[\s\S]{0,60}from OpenCode/);
+  });
+
+  it('documents intentional Claude cross-session messaging', () => {
+    expect(file).toContain('## Claude cross-session messaging');
+    expect(file).toContain('--peer-messaging accept');
+    expect(file).toContain("Claude's `ListAgents` and `SendMessage` tools");
+    expect(file).toContain('backends.claude.peer_messaging accept');
+    expect(file).toContain('one-shot relays appear as\n`paf-relay`');
+  });
+});
+
+describe('Curiosity-engine skill (skills/curiosity-engine/SKILL.md)', () => {
+  const file = readFile('skills/curiosity-engine/SKILL.md');
+
+  it('forbids invalid CLI shapes', () => {
+    expect(file).toContain('phone-a-friend curiosity-engine');
+    expect(file).toContain('comma-separated');
+  });
+
+  it('prescribes PHONE_A_FRIEND_HOST=opencode for OpenCode invocations', () => {
+    expect(file).toContain('PHONE_A_FRIEND_HOST=opencode');
+  });
+
+  it('uses the version-tolerant probe and env-var fallback', () => {
+    expect(file).toContain(PROBE);
+    expect(file).toContain(ENV_FALLBACK);
+    expect(file).toContain('$PAF_NO_DIFF');
+  });
+
+  it('allows Antigravity as a read-only rally backend', () => {
+    expect(file).toContain('antigravity|codex|gemini|ollama');
+    expect(file).toContain('command -v agy');
+    expect(file).toContain('Antigravity CLI not found');
+  });
+});
+
+describe('OpenCode command overlays (skills/<name>/COMMAND.opencode.md)', () => {
+  // These overlays are the OpenCode entry point for the slash command.
+  // The installer's opencodeCommandSource() prefers them over the
+  // host-neutral commands/<name>.md when present, so OpenCode gets a thin
+  // shim that delegates to the rich SKILL.md while Claude gets the rich
+  // commands/<name>.md inline.
+  //
+  // Design choice: the OpenCode shims use the env-var-only suppression
+  // (`PHONE_A_FRIEND_INCLUDE_DIFF=false`), NOT the probe-and-gate pattern.
+  // Rationale: smoke testing showed that small models running in OpenCode
+  // (e.g. gpt-oss-120b) skip the probe block and inline `--no-include-diff`
+  // verbatim, which fails on stale CLIs. The env var is one line, can't
+  // be skipped, and works on every shipped binary (v1.7.2+). Reliability
+  // beats elegance at the entry point.
+
+  for (const name of ['phone-a-friend', 'curiosity-engine']) {
+    describe(`${name} overlay`, () => {
+      const path = join(REPO, `skills/${name}/COMMAND.opencode.md`);
+
+      it('exists', () => {
+        expect(existsSync(path)).toBe(true);
+      });
+
+      it('sets PHONE_A_FRIEND_HOST=opencode for the recursion guard', () => {
+        const file = readFileSync(path, 'utf-8');
+        expect(file).toContain('PHONE_A_FRIEND_HOST=opencode');
+      });
+
+      it('uses PHONE_A_FRIEND_INCLUDE_DIFF=false for diff suppression', () => {
+        const file = readFileSync(path, 'utf-8');
+        expect(file).toContain(ENV_FALLBACK);
+      });
+
+      it('does NOT mention $PAF_NO_DIFF (probe variable belongs in rich content only)', () => {
+        const file = readFileSync(path, 'utf-8');
+        expect(file).not.toContain('$PAF_NO_DIFF');
+      });
+
+      it('does NOT use --no-include-diff as a literal flag (small models would copy it onto stale binaries)', () => {
+        const file = readFileSync(path, 'utf-8');
+        // Allow the flag inside markdown inline code (backticks) for prose
+        // explanations. Forbid it as an actual command argument.
+        // The negative lookbehind ensures the flag isn't immediately preceded
+        // by a backtick (markdown formatting).
+        expect(file).not.toMatch(/(?<!`)--no-include-diff/);
+      });
+
+      it('does not carry a stale backend list that omits antigravity', () => {
+        const file = readFileSync(path, 'utf-8');
+        expect(file).not.toContain('codex|gemini|ollama');
+        expect(file).not.toContain('codex`, `gemini`, or `ollama`');
+        if (name === 'phone-a-friend') {
+          expect(file).toContain('antigravity');
+        }
+      });
+    });
+  }
+});
+
+describe('Shell materialization hardening', () => {
+  for (const rel of ['commands/phone-a-friend.md', 'skills/phone-a-friend/SKILL.md']) {
+    describe(rel, () => {
+      const file = readFile(rel);
+
+      it('uses temp files and quoted heredocs for prompt/context payloads', () => {
+        expect(file).toContain('PROMPT_FILE="$(mktemp)"');
+        expect(file).toContain('CONTEXT_FILE="$(mktemp)"');
+        expect(file).toContain('trap \'rm -f "$PROMPT_FILE" "$CONTEXT_FILE"\' EXIT');
+        expect(file).toContain("cat > \"$PROMPT_FILE\" <<'PAF_PROMPT_EOF'");
+        expect(file).toContain("cat > \"$CONTEXT_FILE\" <<'PAF_CONTEXT_EOF'");
+        expect(file).toContain('--prompt "$(cat "$PROMPT_FILE")"');
+        expect(file).toContain('--context-file "$CONTEXT_FILE"');
+      });
+    });
+  }
+
+  for (const rel of ['commands/curiosity-engine.md', 'skills/curiosity-engine/SKILL.md']) {
+    describe(rel, () => {
+      const file = readFile(rel);
+
+      it('does not inline topic/question prompts into shell arguments', () => {
+        expect(file).toContain('TOPIC_SAFE = TOPIC');
+        expect(file).toContain('PROMPT_FILE="$(mktemp)"');
+        expect(file).toContain('trap \'rm -f "$PROMPT_FILE" "${REPROMPT_FILE:-}"\' EXIT');
+        expect(file).toContain("cat <<'PAF_CURIOSITY_PROMPT_EOF'");
+        expect(file).toContain('REPROMPT_FILE="$(mktemp)"');
+        expect(file).toContain("cat > \"$REPROMPT_FILE\" <<'PAF_CURIOSITY_REPROMPT_EOF'");
+        expect(file).toContain('--prompt "$(cat "$PROMPT_FILE")"');
+        expect(file).toContain('--prompt "$(cat "$REPROMPT_FILE")"');
+        expect(file).toContain('jq -Rs . < "$PROMPT_FILE"');
+      });
+    });
+  }
+
+  describe('commands/phone-a-team.md', () => {
+    const file = readFile('commands/phone-a-team.md');
+
+    it('validates model names before shell materialization', () => {
+      // The widened class allows `/` for OpenCode `provider/model` identifiers;
+      // `/` is not a shell metacharacter, so the injection guard is unchanged.
+      expect(file).toContain('^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$');
+      expect(file).toContain('abort and ask the user for a safe model name');
+    });
+
+    it('keeps the strict no-slash pattern for config-sourced ollama models', () => {
+      // Before OpenCode widened the --model class, all three occurrences were
+      // the same string, so the assertion above covered this site too. They
+      // have diverged: backends.ollama.model never contains `/`, so it must
+      // keep the strict class. Anchor on the surrounding prose so this can
+      // never accidentally match the widened pattern.
+      expect(file).toMatch(
+        /backends\.ollama\.model[\s\S]{0,200}\^\[A-Za-z0-9]\[A-Za-z0-9\._:-]\{0,127}\$/,
+      );
+    });
+
+    it('scopes MODEL_OVERRIDE away from backends with closed model naming', () => {
+      // The override must never reach codex/gemini/claude in a multi-backend
+      // round -- they use incompatible model-naming schemes.
+      expect(file).toContain('**Per-backend scoping (multi-backend rounds):**');
+      expect(file).toMatch(
+        /apply the override ONLY[\s\S]{0,120}`ollama` and `opencode`/,
+      );
+      expect(file).toMatch(
+        /Do NOT pass it to\s+`antigravity`, `codex`, `gemini`, or `claude`/,
+      );
+      // `both` is codex + gemini, so no member can ever receive the override.
+      expect(file).toMatch(/BACKEND is `both` and `--model` is present:\s+\*\*abort\*\*/);
+    });
+
+    it('skips ollama in all-backend rounds when the override is unavailable', () => {
+      expect(file).toContain(
+        '`OLLAMA_SKIP_REASON = model override "<name>" is not installed locally`',
+      );
+      expect(file).toContain('exclude `ollama` when building `BACKENDS`');
+      expect(file).toMatch(
+        /If not found and BACKEND is exactly `ollama`, \*\*abort\*\*/,
+      );
+    });
+
+    it('never passes bare model names to opencode in direct mode', () => {
+      expect(file).toMatch(
+        /OpenCode direct mode\s+requires `--model <provider\/model>`/,
+      );
+      expect(file).toContain(
+        '`OPENCODE_SKIP_REASON = direct mode requires provider/model`',
+      );
+      expect(file).toMatch(
+        /Direct mode must never pass a bare model\s+name to `opencode run`\./,
+      );
+    });
+
+    it('documents the opencode sandbox limit and read-only prompt guard', () => {
+      expect(file).toMatch(
+        /neither the\s+PaF backend nor `opencode run` can enforce read-only access for OpenCode/,
+      );
+      expect(file).toMatch(
+        /the user's\s+OpenCode permission config is the enforcement boundary/,
+      );
+      expect(file).toContain('Do not modify files. Review or advise only.');
+    });
+
+    it('uses prompt/context files for dynamic relay payloads', () => {
+      expect(file).toContain('Shell safety rule');
+      expect(file).toContain('trap \'rm -f "$PROMPT_FILE" "$CONTEXT_FILE"\' EXIT');
+      expect(file).toContain("cat > \"$PROMPT_FILE\" <<'PAF_TEAM_PROMPT_EOF'");
+      expect(file).toContain("cat > \"$CONTEXT_FILE\" <<'PAF_TEAM_CONTEXT_EOF'");
+      expect(file).toContain('--prompt "$(cat "$PROMPT_FILE")"');
+      expect(file).toContain('--context-file "$CONTEXT_FILE"');
+    });
+
+    it('documents the corrected Gemini direct sandbox mapping', () => {
+      // --sandbox for read-only and workspace-write, omitted only for danger-full-access;
+      // each sandbox now also names its approval mode instead of --yolo.
+      expect(file).toContain('`read-only` is `--sandbox --approval-mode plan`');
+      expect(file).toContain('`workspace-write` is\n  `--sandbox --approval-mode auto_edit`');
+      expect(file).toMatch(/`danger-full-access` is\s+`--approval-mode yolo` without `--sandbox`/);
+      expect(file).not.toContain('For workspace-write, omit `--sandbox`');
+    });
+  });
+
+  describe('OpenCode overlays', () => {
+    it('keeps the phone-a-friend overlay on the same temp-file prompt pattern', () => {
+      const file = readFile('skills/phone-a-friend/COMMAND.opencode.md');
+      expect(file).toContain('PROMPT_FILE="$(mktemp)"');
+      expect(file).toContain('trap \'rm -f "$PROMPT_FILE"\' EXIT');
+      expect(file).toContain("cat > \"$PROMPT_FILE\" <<'PAF_PROMPT_EOF'");
+      expect(file).toContain('--prompt "$(cat "$PROMPT_FILE")"');
+    });
+
+    it('tells curiosity-engine OpenCode users not to inline dynamic prompt text', () => {
+      const file = readFile('skills/curiosity-engine/COMMAND.opencode.md');
+      expect(file).toContain('single-quoted heredocs');
+      expect(file).toContain('Do not inline dynamic');
+    });
+  });
+});
+
+describe('Curiosity-engine is host-neutral about the orchestrator', () => {
+  // The skill ships in OpenCode now, so the orchestrator is "Claude in
+  // Claude Code" but "the OpenCode model in OpenCode". Smoke testing
+  // showed that small models read "Claude serves first" as an instruction
+  // to relay to `phone-a-friend --to claude`. Pin host-neutral phrasing.
+
+  for (const rel of ['commands/curiosity-engine.md', 'skills/curiosity-engine/SKILL.md']) {
+    describe(rel, () => {
+      const file = readFile(rel);
+
+      it('description does not lock the orchestrator to Claude', () => {
+        // Frontmatter description is what shows in skill listings.
+        const fm = file.match(/^---\n([\s\S]+?)\n---/)?.[1] ?? '';
+        expect(fm).toContain('description:');
+        expect(fm).not.toMatch(/description:[^\n]*Q&A rally between Claude/);
+      });
+
+      it('forbids relaying the orchestrator role to a backend', () => {
+        // Hard rule that prevents the smoke-test failure mode. The rule may
+        // wrap across newlines because of markdown line wrapping.
+        expect(file).toMatch(/Do (?:NOT|not) call\s+`phone-a-friend --to claude`/);
+      });
+
+      it('uses orchestrator-neutral phrasing in round flow', () => {
+        // These exact phrases were the source of the smoke-test bug.
+        expect(file).not.toContain('Claude serves first');
+        expect(file).not.toContain("Claude's question for you");
+        expect(file).not.toContain("Claude's question");
+        expect(file).not.toContain("question for Claude");
+        expect(file).not.toContain("Claude never breaks the schema");
+      });
+
+      it('teaches the orchestrator role with host-neutral wording', () => {
+        // At least one of these neutral phrases must appear.
+        expect(file).toMatch(/orchestrating agent|orchestrator/);
+      });
+    });
+  }
+});
+
+describe('Context hygiene rule prevents repo-content dumping', () => {
+  // Real incident on PR #101 review: the orchestrator (Claude) was about to
+  // dump `git show HEAD` into a temp file and pass it via `--context-file`
+  // to a backend that already had `--repo` access. The user caught it
+  // before the relay fired. The existing instructions did not forbid the
+  // pattern; in fact, both phone-a-friend files explicitly recommended
+  // "use a repo-local temp file" for large context — directly encouraging
+  // the anti-pattern.
+  //
+  // Pin the new Context Hygiene rule everywhere it applies, and pin the
+  // absence of the recommendation it replaced.
+
+  const filesWithRule = [
+    'commands/phone-a-friend.md',
+    'skills/phone-a-friend/SKILL.md',
+    'commands/phone-a-team.md',
+    'commands/curiosity-engine.md',
+    'skills/curiosity-engine/SKILL.md',
+  ];
+
+  for (const rel of filesWithRule) {
+    describe(rel, () => {
+      const file = readFile(rel);
+
+      it('mentions the specific bad patterns (git show / git diff / git status)', () => {
+        expect(file).toMatch(/git show/);
+        expect(file).toMatch(/git diff/);
+        expect(file).toMatch(/git status/);
+      });
+
+      it('forbids dumping repo files / git output into context flags', () => {
+        // Either "Do NOT dump" (curiosity-engine, phone-a-friend bullet,
+        // phone-a-team bullet) or "Do not generate" (the dedicated section).
+        expect(file).toMatch(/Do (?:NOT|not) dump|Do not generate/);
+      });
+
+      it('preserves legitimate narrative context as allowed use', () => {
+        // Without this, future edits could overcorrect and ban useful
+        // conversation summaries / analysis.
+        expect(file).toMatch(/narrative context|conversation history|analysis|prior model output|prior round/);
+      });
+
+      it('does not recommend repo-local temp files', () => {
+        // The line "use a repo-local temp file" was directly encouraging
+        // the dumping anti-pattern. It must not return.
+        expect(file).not.toMatch(/use a repo-local temp file/);
+      });
+    });
+  }
+
+  // Phone-a-friend files get the dedicated section, not just a bullet.
+  // It must mention the Ollama exception (Ollama has localFileAccess: false).
+  for (const rel of ['commands/phone-a-friend.md', 'skills/phone-a-friend/SKILL.md']) {
+    it(`${rel} has a dedicated Context hygiene section with Ollama exception`, () => {
+      const file = readFile(rel);
+      expect(file).toContain('## Context hygiene');
+      expect(file).toMatch(/ollama|Ollama/);
+      expect(file).toMatch(/localFileAccess|cannot read the repo/);
+    });
+  }
+});
+
+describe('Review scope guidance', () => {
+  for (const rel of ['commands/phone-a-friend.md', 'skills/phone-a-friend/SKILL.md']) {
+    it(`${rel} maps code-review surfaces to explicit scopes`, () => {
+      const file = readFile(rel);
+      expect(file).toContain('`--review-scope branch|working-tree|all`');
+      expect(file).toMatch(/`branch` for committed/);
+      expect(file).toMatch(/`working-tree` for staged\/unstaged\/untracked/);
+      expect(file).toMatch(/`all`[\s\S]{0,80}both/);
+      expect(file).toContain('never with review mode');
+      expect(file).toContain('phone-a-friend relay --help` for `--review-scope`');
+      expect(file).toMatch(/legacy `--include-diff` omits[\s\S]{0,40}untracked/);
+      expect(file).toContain('No changes found for review scope');
+      expect(file).toMatch(/clean selected scope[\s\S]{0,120}never calls[\s\S]{0,120}backend/);
+      expect(file).toMatch(/`--verdict-json` returns `abstain`/);
+    });
+  }
+
+  it('phone-a-team selects a review scope instead of mixing review with include-diff', () => {
+    const file = readFile('commands/phone-a-team.md');
+    expect(file).toContain('`--review-scope branch`');
+    expect(file).toContain('`working-tree` for staged/unstaged/untracked');
+    expect(file).toMatch(/`all` for both/);
+    expect(file).toContain('--review --review-scope <scope> --verdict-json');
+    expect(file).toContain('phone-a-friend relay --help` for `--review-scope`');
+    expect(file).toContain('No changes found for review scope');
+    expect(file).toMatch(/not reviewer uncertainty/);
+  });
+});
+
+describe('Probe pattern uses subcommand help, not top-level help', () => {
+  // Top-level `phone-a-friend --help` lists subcommands but NOT relay flags
+  // (relay-specific flags live under `phone-a-friend relay --help`).
+  // A bare `phone-a-friend --help | grep` probe always returns false even
+  // on new binaries, silently disabling the explicit flag and forcing the
+  // env-var fallback. Pin the correct subcommand probe.
+  //
+  // Rich content (commands/* and skills/*/SKILL.md) MUST contain the
+  // probe — capable orchestrators use it to prefer the cleaner flag.
+  // OpenCode overlays explicitly do NOT use the probe (covered by a
+  // separate suite above).
+
+  const richContentFiles = [
+    'commands/phone-a-friend.md',
+    'commands/curiosity-engine.md',
+    'commands/phone-a-team.md',
+    'skills/phone-a-friend/SKILL.md',
+    'skills/curiosity-engine/SKILL.md',
+  ];
+
+  for (const rel of richContentFiles) {
+    it(`${rel} uses 'relay --help' not bare '--help'`, () => {
+      const file = readFile(rel);
+      const probeLines = file
+        .split('\n')
+        .filter(line => line.includes("grep -q -- '--no-include-diff'"));
+      // Rich content must always have at least one probe line.
+      expect(probeLines.length).toBeGreaterThan(0);
+      for (const line of probeLines) {
+        expect(line).toContain('relay --help');
+      }
+    });
+  }
+});
+
+/**
+ * YAML frontmatter must parse cleanly with a strict parser.
+ *
+ * Codex CLI uses a stricter YAML loader than Claude Code or OpenCode. If a
+ * description contains `: ` (colon-space) inside an unquoted plain scalar,
+ * Codex rejects it as "mapping values are not allowed in this context",
+ * silently skips the skill, and surfaces a startup warning. Claude/OpenCode
+ * are permissive enough that the bug goes unnoticed until a Codex user
+ * loads the skill. This test pins the contract: every shipped frontmatter
+ * MUST round-trip through a strict YAML parser.
+ */
+describe('shipped skill and command frontmatter parses as strict YAML', () => {
+  const files = [
+    'commands/phone-a-friend.md',
+    'commands/phone-a-team.md',
+    'commands/curiosity-engine.md',
+    'skills/phone-a-friend/SKILL.md',
+    'skills/phone-a-friend/COMMAND.opencode.md',
+    'skills/curiosity-engine/SKILL.md',
+    'skills/curiosity-engine/COMMAND.opencode.md',
+    'skills/phone-a-team/.codex/SKILL.md',
+  ];
+
+  for (const rel of files) {
+    it(`${rel} has valid YAML frontmatter`, () => {
+      const raw = readFile(rel);
+      // parseFrontmatter throws on YAML errors; the assertion is the absence
+      // of a throw plus the result being an object (sanity check).
+      const parsed = parseFrontmatter(raw);
+      expect(parsed).toBeTypeOf('object');
+      expect(parsed).not.toBeNull();
+    });
+  }
+});
+
+/**
+ * Direct mode calls Gemini CLI without PaF, so the skill text is the only thing
+ * that picks the approval mode. `--yolo` auto-approves every tool, which made a
+ * "read-only" direct relay writable. Gemini CLI 0.42.0 through 0.50.0 accept
+ * `--approval-mode plan` ("read-only mode" in `gemini --help`).
+ */
+describe('direct-mode Gemini commands use approval modes, never --yolo', () => {
+  const READ_ONLY_DIRECT = [
+    'skills/phone-a-friend/SKILL.md',
+    'skills/curiosity-engine/SKILL.md',
+    'commands/phone-a-friend.md',
+    'commands/curiosity-engine.md',
+    'plugins/phone-a-friend/skills/phone-a-friend/SKILL.md',
+    'plugins/phone-a-friend/skills/curiosity-engine/SKILL.md',
+  ];
+
+  for (const rel of READ_ONLY_DIRECT) {
+    it(`${rel}: every direct gemini call is --sandbox --approval-mode plan and the caveat is stated`, () => {
+      const text = readFile(rel);
+      // Direct calls start the line (or a table cell) with `gemini`; `--to gemini` is a PaF call.
+      const calls = text.split('\n').filter((l) => /(^\s*|`)gemini --/.test(l));
+      expect(calls.length).toBeGreaterThan(0);
+      for (const line of calls) {
+        expect(line).toContain('gemini --sandbox --approval-mode plan');
+        expect(line).not.toMatch(/--yolo\b/);
+      }
+      expect(text).toContain('headless Gemini may exit Plan Mode and switch to YOLO');
+    });
+  }
+
+  it('commands/phone-a-team.md maps each sandbox to an approval mode and never adds --yolo', () => {
+    const text = readFile('commands/phone-a-team.md');
+    expect(text).toContain('`read-only` is `--sandbox --approval-mode plan`');
+    expect(text).toContain('`workspace-write` is\n  `--sandbox --approval-mode auto_edit`');
+    expect(text).toContain('`danger-full-access` is\n  `--approval-mode yolo` without `--sandbox`');
+    // The caveat is the security-relevant part: Plan Mode is not an enforced boundary headless.
+    expect(text).toMatch(/headless Gemini may exit Plan Mode and\s+switch to YOLO/);
+    expect(text).toContain('Use Antigravity when enforced read-only behavior is required.');
+    const calls = text.split('\n').filter((l) => /(^\s*|`)gemini (--|<|\[)/.test(l));
+    expect(calls.length).toBeGreaterThan(0);
+    for (const line of calls) expect(line).not.toMatch(/--yolo\b/);
+  });
+});
+
+describe('grok as a host', () => {
+  const friend = readFile('skills/phone-a-friend/SKILL.md');
+  const command = readFile('commands/phone-a-friend.md');
+  const curiosity = readFile('skills/curiosity-engine/SKILL.md');
+
+  it('phone-a-friend tells a Grok host not to pick grok and to set the host marker', () => {
+    expect(friend).toMatch(/From Grok, do not select `grok` as the friend backend/);
+    expect(friend).toContain('PHONE_A_FRIEND_HOST=grok');
+    expect(friend).toContain('GROK_AGENT=1');
+    expect(friend).toContain('In Claude Code, Codex, and Grok');
+    expect(command).toContain('PHONE_A_FRIEND_HOST=grok');
+    expect(command).toContain('Claude Code, Codex, and Grok');
+  });
+
+  it('keeps grok out of the default parallel loop', () => {
+    expect(friend).toMatch(/for BACKEND in claude gemini;/);
+    expect(friend).not.toMatch(/for BACKEND in[^\n]*\bgrok\b/);
+    expect(friend).toMatch(/leave it out of this default loop/);
+  });
+
+  it('shows the read-only direct call and reads text from the envelope', () => {
+    expect(friend).toContain('grok --no-auto-update --output-format json --cwd "$PWD" --prompt-file "$PROMPT_FILE"');
+    expect(friend).toContain('--sandbox read-only --permission-mode dontAsk --allow Read --allow Grep --deny Bash --deny Edit');
+    expect(friend).toMatch(/stopReason` is `stop`, `length`, or `end_turn`/);
+    expect(friend).not.toMatch(/Do not pass `--to grok`, `--session`, or `--fast`/);
+    expect(friend).toContain('`--session` works with Grok');
+    expect(command).not.toMatch(/Do not pass\s+`--session` or `--fast` from Grok/);
+    expect(command).toContain('`--session` works with Grok');
+    expect(curiosity).toContain('--backend antigravity|codex|gemini|ollama|grok');
+    expect(curiosity).toContain('command -v grok');
+    expect(curiosity).toContain('PHONE_A_FRIEND_HOST=grok');
+    expect(curiosity).toMatch(/`--backend` accepts only `antigravity`,\s+`codex`, `gemini`, or `ollama` from Grok/);
+    expect(curiosity).toMatch(/If the host is Grok and\s+`--backend` is `grok`, report an error and stop/);
+    expect(curiosity).not.toMatch(/Choose `antigravity`, `codex`, `gemini`, `claude`/);
+  });
+});
+
+describe('pi as a host', () => {
+  // pi loads a skill from its agent directory and runs it as /skill:<name>
+  // (pi docs: skills.md). The skill text has to say what differs there.
+  const friend = readFile('skills/phone-a-friend/SKILL.md');
+  const curiosity = readFile('skills/curiosity-engine/SKILL.md');
+
+  it('phone-a-friend tells a pi host not to pick pi and why no host marker is needed', () => {
+    expect(friend).toMatch(/From pi, do not select `pi` as the friend backend/);
+    expect(friend).toMatch(/`PI_CODING_AGENT=true`/);
+    expect(friend).not.toContain('PHONE_A_FRIEND_HOST=pi ');
+  });
+
+  it('phone-a-friend names the pi invocation and where the focus text arrives', () => {
+    expect(friend).toContain('/skill:phone-a-friend');
+    expect(friend).toMatch(/In pi[^\n]*\$ARGUMENTS[^\n]*not substituted/);
+  });
+
+  it('phone-a-friend suppresses the diff with the env var from pi, like OpenCode', () => {
+    expect(friend).toMatch(/When running inside pi, prefix relay invocations with\s+`PHONE_A_FRIEND_INCLUDE_DIFF=false`/);
+  });
+
+  it('phone-a-friend says /phone-a-team is not installed in pi', () => {
+    expect(friend).toMatch(/In OpenCode and pi, run\s+separate invocations yourself/);
+  });
+
+  it('curiosity-engine covers the pi host', () => {
+    expect(curiosity).toContain('/skill:curiosity-engine');
+    expect(curiosity).toMatch(/Inside pi, no host prefix is needed/);
+    expect(curiosity).toMatch(/the pi model name in pi/);
+  });
+});
+
+describe('pi is binary-mode only in every skill and command', () => {
+  // A direct `pi` call would skip the tool allowlist, the fail-closed
+  // session check, schema and verdict validation, task tracking and the
+  // recursion guard, so no file may carry a direct-call row for it.
+  const RELAY_FILES = ['skills/phone-a-friend/SKILL.md', 'commands/phone-a-friend.md'];
+  const ORCHESTRATOR_FILES = [
+    'commands/phone-a-team.md',
+    'commands/curiosity-engine.md',
+    'skills/curiosity-engine/SKILL.md',
+    'skills/phone-a-team/.codex/SKILL.md',
+  ];
+
+  for (const rel of [...RELAY_FILES, ...ORCHESTRATOR_FILES]) {
+    it(`${rel} has no direct-call row or direct command for pi`, () => {
+      const file = readFile(rel);
+      expect(file).not.toMatch(/^\|\s*\*\*pi\*\*\s*\|/im);
+      expect(file).not.toMatch(/^\s*pi\s+(--mode|-p\b|--print)/m);
+      expect(file).not.toContain('command -v pi');
+    });
+  }
+
+  for (const rel of RELAY_FILES) {
+    describe(rel, () => {
+      const file = readFile(rel);
+
+      it('names pi as a backend and shows the binary-mode relay', () => {
+        expect(file).toMatch(/description:[^\n]*\bpi\b/);
+        expect(file).toMatch(/--to pi --repo "\$PWD"/);
+      });
+
+      it('says pi has no direct mode, in one line under the direct-call table', () => {
+        expect(file).toMatch(/pi has no direct-call row[^\n]*binary mode/);
+      });
+
+      it('documents --fast, sessions and the provider setting for pi', () => {
+        expect(file).toMatch(/`-nc -ns` for pi/);
+        const sessions = rel.startsWith('skills/') ? readFile('skills/phone-a-friend/references/sessions.md') : file;
+        expect(sessions).toMatch(/\*\*pi\*\*: native session resume via `--session`/);
+        expect(file).toContain('[backends.pi]');
+      });
+    });
+  }
+
+  for (const rel of ORCHESTRATOR_FILES) {
+    it(`${rel} says pi is reachable through /phone-a-friend only and is not a --backend choice`, () => {
+      const file = readFile(rel);
+      expect(file).toMatch(/pi is not a `--backend` choice[^\n]*`phone-a-friend --to pi`/);
+      expect(file).not.toMatch(/--backend [^\n]*\bpi\b/);
+    });
+  }
+
+  it('the OpenCode overlay and the reviewer subagent list pi among the backends', () => {
+    expect(readFile('skills/phone-a-friend/COMMAND.opencode.md')).toMatch(/`claude`, `pi`, `grok`, or `ollama`/);
+    expect(readFile('agents/paf-reviewer.md')).toMatch(/description:[^\n]*\bpi\b/);
+  });
+});

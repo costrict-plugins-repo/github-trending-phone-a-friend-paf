@@ -1,0 +1,763 @@
+# AGENTS.md
+
+Guidance for AI coding agents working in `phone-a-friend`.
+
+## What This Is
+
+`phone-a-friend` is a TypeScript CLI for relaying prompts + repository context to coding backends (Claude, Antigravity, Codex, Gemini, Ollama, OpenCode, pi, Grok). Available via `npm install -g @freibergergarcia/phone-a-friend` or from source. All backend `run()` methods are async (`Promise<string>`). Backends may also implement `runStream()` returning `AsyncIterable<string>` for token-level streaming.
+
+## Project Structure
+
+```
+src/
+  index.ts           Entry point — imports backends, runs CLI
+  cli.ts             Commander.js CLI with subcommands
+  relay.ts           Backend-agnostic relay core (relay + relayStream + reviewRelay)
+  stream-parsers.ts  Stream parsers — SSE (OpenAI-compatible), NDJSON (Ollama), Claude JSON snapshots
+  context.ts         RelayContext interface
+  version.ts         Shared version reader
+  detection.ts       Backend detection (CLI, Local, Host)
+  config.ts          TOML configuration system
+  doctor.ts          Health check command
+  diagnostics.ts     PATH/executable identity and bounded version probes for doctor
+  setup.ts           Interactive setup wizard
+  installer.ts       Claude/OpenCode/Codex/pi/Grok host integration installer (symlink/copy)
+  theme.ts           Shared semantic theme (chalk) for CLI styling + banner
+  display.ts         Display helpers (mark, formatBackendLine)
+  jobs.ts            Background job manager (JSON persistence at ~/.config/phone-a-friend/jobs.json)
+  sessions.ts        Relay session store (SQLite at ~/.config/phone-a-friend/sessions.db; imports legacy JSON)
+  tasks.ts           Task store (SQLite at ~/.config/phone-a-friend/tasks.db): durable records + events for every relay/review
+  task-tracking.ts   Bridges one CLI run to the task store (RelayObserver, retention modes, drift warning)
+  progress.ts        Progress reporter: observer hooks -> stderr lines or spinner text, plus the end-of-run receipt
+  status-line.ts     One-row status for Claude Code's status line (running or recently finished task for the cwd repo)
+  backends/
+    index.ts         Backend interface, registry, types, BackendCapabilities, spawnCli() async subprocess utility
+    antigravity.ts  Google Antigravity CLI subprocess backend (`agy`, read-only, native sessions)
+    claude.ts        Claude CLI subprocess backend (`claude -p`)
+    codex.ts         Codex subprocess backend
+    gemini.ts        Gemini subprocess backend
+    ollama.ts        Ollama HTTP API backend (native fetch)
+    opencode.ts      OpenCode CLI subprocess backend (`opencode run`, agentic with tool calling)
+    pi.ts            pi CLI subprocess backend (`pi --mode json`, tool allowlist per sandbox, PaF-owned sessions)
+    grok.ts          Grok Build CLI subprocess backend (`grok --prompt-file`, allow list per sandbox, native resume and streaming)
+    schema-prompt.ts Shared schema-in-prompt helper for backends without a structured-output flag
+  agentic/
+    index.ts         Public API — Orchestrator, TranscriptBus exports
+    types.ts         AgentConfig, AgenticSessionConfig, AgentState, Message, AGENTIC_DEFAULTS
+    orchestrator.ts  Main loop — spawn agents, route messages, guardrails, emit events
+    session.ts       SessionManager — Claude CLI subprocess with UUID-based sessions
+    bus.ts           SQLite transcript bus (better-sqlite3) — append-only session log
+    queue.ts         In-memory MessageQueue for runtime routing
+    events.ts        AgenticEvent discriminated union + EventChannel (push/pull bridge)
+    parser.ts        @mention extraction + system prompt builder
+    names.ts         Creative agent name assignment (e.g., ada.reviewer)
+  tui/
+    App.tsx          Root TUI component — tab bar + panel routing
+    render.tsx       Ink render entry point
+    StatusPanel.tsx  System info + backend detection display
+    BackendsPanel.tsx Per-backend list with detail pane
+    ConfigPanel.tsx  Config view + inline editing
+    ActionsPanel.tsx Async-wrapped executable actions
+    AgenticPanel.tsx Session browser with list view
+    hooks/
+      useDetection.ts    Async detection with throttled refresh
+      usePluginStatus.ts Host integration install status (sync FS check)
+      useAgenticSessions.ts  SQLite session loader for Agentic panel
+    components/
+      TabBar.tsx             Tab navigation bar
+      PluginStatusBar.tsx    Persistent host integration install indicator
+      Badge.tsx              Status badges (✓ ✗ ! ·)
+      KeyHint.tsx            Footer keyboard hints
+      ListSelect.tsx         Scrollable selectable list
+tests/               Vitest tests (mirrors src/ structure, includes spawn-cli, jobs, background-relay)
+commands/<name>.md   Rich Claude Code slash commands (full workflow, argument-hint, Gemini model selection, etc.)
+agents/paf-reviewer.md   Claude plugin subagent (background, Bash+Read, sonnet): runs one PaF command and reports receipt + verbatim findings
+mods/paf-tasks/          Optional Claude Code mod (separate plugin `paf-tasks`): review panel, conversation rows, spinner and band for PaF calls; tests run with `claude plugin test`, not vitest
+skills/<name>/SKILL.md         Canonical Agent Skills — primary OpenCode entry point, also auto-discovered by Claude Code as plugin-namespaced skills
+skills/<name>/COMMAND.opencode.md  Thin OpenCode command shim (overlay). Installer prefers this over commands/<name>.md when present, so OpenCode users get a small shim that delegates into SKILL.md while Claude users get the rich commands/<name>.md inline.
+dist/                Built bundle (committed, self-contained)
+```
+
+## Core Behavior
+
+- Relay core is backend-agnostic in `src/relay.ts` — `relay()` for batch, `relayStream()` for streaming, `reviewRelay()` for diff-scoped review, `relayBackground()` for quiet mode with job tracking
+- Backend interface/registry in `src/backends/index.ts` — `run()` required, `runStream()` and `review()` optional, `capabilities` declares resume strategy and session ID requirements
+- Shared `spawnCli()` async subprocess utility in `src/backends/index.ts` — used by all CLI backends (Antigravity, Codex, Claude, Gemini, OpenCode, pi, Grok) for non-blocking execution with timeout, signal forwarding, stderr draining, and spawn error handling. `killGraceMs` is an opt-in SIGKILL escalation after the timeout's SIGTERM (pi and Grok pass 2s). Throws `SpawnCliError` (extends `BackendError`) on non-zero exit, preserving stdout/stderr/exitCode for callers that need partial output from failed runs
+- `BackendRunOptions` shared interface in `src/backends/index.ts` — single options type for `run()` and `runStream()` across all backends, includes schema, session, and fast spawn fields
+- `Backend.preparePrompt?(prompt, { mode })` — optional last-step rewrite of the fully built prompt, applied by `finalizePrompt()` in `src/relay.ts` on every path (relay, raw and managed sessions, stream, generic review) before the prompt size limit. Only Antigravity implements it today; every other backend's prompt is byte-identical to before the hook existed.
+- `RelayObserver` in `src/relay.ts` — optional `onScope`, `onDrift`, `onEvent`, `onSessionLinked` hooks passed via `observer` on `RelayOptions`/`ReviewRelayOptions`. Backends report progress through `BackendRunOptions.onEvent`/`ReviewOptions.onEvent` as `BackendEvent`s; no hook is invoked and no progress stream is requested unless the caller supplied one. Used by task tracking (see "Task tracking").
+- Backend `localFileAccess: boolean` property — declares whether the backend can read repo files via its own tooling when given a repo path. `true` for antigravity/codex/gemini/claude/opencode/pi/grok (PaF passes `--repo`/`--dir`/equivalent, or spawns in the repo, and the backend reads files itself). `false` for ollama (HTTP API, no native file access; receives only prompt + context + diff payloads, never raw file contents). PaF does not auto-inline repo files for either case — keeping local files out of the relay payload is the responsibility of the caller (see "Context hygiene" rules in the relay-issuing skills/commands).
+- Antigravity backend in `src/backends/antigravity.ts` (`agy --add-dir <repo> --print-timeout <seconds>s --sandbox --mode plan --prompt <prompt>`, read-only only, native conversation resume, native `--json-schema` with the value read from the envelope's `structured_output`). Headless `agy` auto-denies shell commands, so the backend implements `preparePrompt()` to prefix every relay and review prompt with a one-line notice; without it the model reaches for `git` and returns nothing.
+- Claude backend in `src/backends/claude.ts` (`run()` via `spawnCli()`, `runStream()` via direct `spawn` with streaming parser, Claude Code 2.1.224+ peer messaging via `native|accept|refuse`)
+- Codex backend in `src/backends/codex.ts` (via `spawnCli()`, output file + stdout fallback)
+- Gemini backend in `src/backends/gemini.ts` (via `spawnCli()`). Sandbox maps to Gemini's approval mode: `read-only` sends `--sandbox --approval-mode plan` (Gemini Plan Mode, a best-effort restriction: in headless execution Gemini may exit Plan Mode and switch to YOLO, so it is not an enforced write boundary; use `--to antigravity` when enforced read-only behavior is required), `workspace-write` sends `--sandbox --approval-mode auto_edit`, `danger-full-access` sends `--yolo`. Before this mapping every sandbox sent `--yolo`. A CLI that rejects `--approval-mode` gets an upgrade error; the retired individual-account error (`IneligibleTierError`) is rewritten to name `GEMINI_API_KEY` and `--to antigravity`.
+- Ollama HTTP backend in `src/backends/ollama.ts` (fetch to localhost:11434, already async)
+- OpenCode CLI backend in `src/backends/opencode.ts` (`run()` and `runStream()` via subprocess, `review()` with native repo access, model normalization `qwen3-coder` to `ollama/qwen3-coder`, NDJSON output parsing, session support via `--session`). Two OpenCode lines both install as `opencode`: 1.x (`opencode-ai`, what README/brew/docs install) and 2.x (`@opencode/cli`). PaF probes `opencode --version` once per process (`detectOpenCodeMajor()`, cached by resolved executable + PATH, concurrent callers share the probe) and builds arguments per line: 1.x gets `--dir <repo>` and `--pure` for `--fast`/`pure = true`; 2.x rejects both, relies on the spawn `cwd`, and takes `--standalone` when `backends.opencode.standalone = true`. When the version cannot be read PaF emits only line-neutral arguments and fails closed if `--fast`, `pure`, or `standalone` was requested. Both error-event shapes are parsed (1.x `error.data.message`, 2.x `error.type` + `error.message`). Doctor prints an advisory on 2.x.
+- pi backend in `src/backends/pi.ts` (`pi --mode json`, the `@earendil-works/pi-coding-agent` CLI; `run()` via `spawnCli()`, `runStream()` via direct `spawn`; no native `review()`, so every review scope uses PaF's generic diff path). Its purpose here is tool-using relays to local OpenAI-compatible servers defined in pi's `models.json` (verified against an MLX server). Arguments come from one builder, `buildPiArgs()`: `--mode json --no-approve`, then `--no-session` or `--session-dir <PaF dir> --session-id <id>`, then `-ne -np --no-themes --tools <list>`, optional `--provider`/`--model`, `-nc -ns` for `--fast`, and the prompt after `--`. pi has no sandbox and no `--dir` flag, so:
+  - **Sandbox is a tool allowlist, not OS isolation.** `read-only` sends `--tools read,grep,find,ls`, `workspace-write` adds `edit,write`, `danger-full-access` adds `bash`. pi still runs with the user's permissions. `-ne` and `--no-approve` are always passed, because an extension or a project-local file could otherwise re-enable tools; from pi 0.99 `-ne` also disables pi's built-in extensions (MCP servers, codemode, tool search, the llama.cpp provider), so a provider must come from pi's `models.json`. Verified on 0.87.1 and 0.99.1: a user `defaultTools` setting and a project `.pi/settings.json` or `mcp.json` do not widen the list.
+  - **The spawn cwd is the repo**, as `realpathSync(resolve(repoPath))`, because pi records that path in the session header.
+  - **Output is judged from the JSONL stream, not the exit code.** pi exits 0 when a response failed. Only a final assistant message with `stopReason` `stop` or `length` and non-empty text is an answer; `error`/`aborted`, any other stop reason, or an empty answer throws. The parser never falls back to an earlier message. A stopped local server shows up as `Connection error.` after pi's three retries (about 14 s), not as a timeout.
+  - **Prompt guard.** A prompt starting with `@` gets a leading newline: pi reads a positional argument that starts with `@` as a file include even after `--`.
+  - **Version gate.** `pi --version` is read once per process (cached by resolved executable + PATH, like `detectOpenCodeMajor()`); below 0.79.0 (no `--no-approve`), unreadable, or missing fails before any spawn.
+  - **Recursion guard.** `--to pi` is refused when `PI_CODING_AGENT=true` (pi sets it for its child processes) or `PHONE_A_FRIEND_HOST=pi`.
+  - **Progress.** Tool calls (`Running: read src/x.ts`), pi's automatic retries and context compaction (`Compacting context (threshold)`, from `compaction_start`; the `compaction_end` summary is never surfaced) are reported as `activity` events on both `run()` and `runStream()`. The detail is an allowlist of named fields per built-in tool (path, pattern, command), never file contents; a tool PaF does not know is reported by name only.
+  - **Cleanup.** On timeout or SIGINT (and, when streaming, a broken stdout or an early `return()`) pi gets SIGTERM, then SIGKILL after 2 s (`PI_KILL_GRACE_MS`) if it has not exited. The batch path gets this through `spawnCli()`'s opt-in `killGraceMs`; backends that do not pass it keep the old SIGTERM-only wait. pi is not started in its own process group, so a killed pi can leave a `bash` tool child behind under `danger-full-access`.
+  - Provider: `[backends.pi] provider` is read through `loadConfig(repoPath)`, so a repo `.phone-a-friend.toml` applies. Model IDs with a slash (`mlx-community/...`) are why provider and model are passed as separate flags.
+- Grok backend in `src/backends/grok.ts` (`grok --no-auto-update --output-format json --cwd <canonical repo> --prompt-file <temp>`; `run()` via `spawnCli()`, `runStream()` via direct spawn; no native `review()` or `preparePrompt()`). `--fast` adds no flag. Native sessions create a UUID with `--session-id` and continue it with `--resume`; both PaF session flags work for relays and generic reviews. `--schema` and `--verdict-json` pass `--json-schema`, preferring the envelope's `structured_output` over `text`. A successful envelope requires a non-empty answer and `stopReason` of `stop`, `length`, or `end_turn`. Streaming reads `streaming-json` text events, drops thoughts, reports tool names only, and requires a successful end event. The CLI selects batch mode for schemas and sessions. Cleanup terminates the child and escalates to SIGKILL after 2s, then removes the temporary prompt file. Raw stdout is never returned.
+  - **Sandbox is an allow list plus a permission mode.** `read-only` and `workspace-write` both send `--permission-mode dontAsk` and `--deny Bash`. `read-only` allows Read and Grep under `--sandbox read-only` and also sends `--deny Edit`. CLI allows merge with project rules, so a project Edit allow would otherwise survive `dontAsk`, and Grok's read-only sandbox still permits writes under `/tmp` and `~/.grok`. `workspace-write` adds Edit under `--sandbox workspace` and does not deny it. On grok 1.0.62 the documented allow filters are Bash, Edit, Read, Grep, MCPTool, WebFetch, and WebSearch; Edit creates files, and there is no Write filter. `deny` wins over `allow`. `danger-full-access` sends `--sandbox off --permission-mode bypassPermissions` with no allow or deny list. `dontAsk` and `bypassPermissions` are values `grok --help` lists on 1.0.62.
+  - **Inherited host marker.** Grok sets `GROK_AGENT=1` on every process it starts, so a later `--to grok` from any of those processes is refused. `inferHost()` still prefers an explicit `PHONE_A_FRIEND_HOST`, then `CLAUDECODE=1`, and only then `GROK_AGENT=1`.
+  - **Recursion guard.** `--to grok` is refused when `GROK_AGENT=1` (Grok sets it on every child) or `PHONE_A_FRIEND_HOST=grok`, before a second grok process starts.
+  - A missing `grok` binary is optional in doctor, same as pi and OpenCode. When the binary is present, doctor prints an advisory: `--fast` has no effect, and `--cwd` still loads project instructions.
+- Stream parsers in `src/stream-parsers.ts` — SSE (OpenAI-compatible), NDJSON (Ollama), Claude JSON snapshots, OpenCode NDJSON events
+- Backend detection (CLI + Local + Host) in `src/detection.ts`
+- TOML config system in `src/config.ts` — `defaults.stream = true` enables streaming by default
+- Depth guard env var: `PHONE_A_FRIEND_DEPTH`
+- Default sandbox: `read-only`
+
+## Agentic Mode
+
+Multi-agent orchestration where agents communicate via @mentions within a shared session.
+
+### Session lifecycle
+
+```
+run(config)
+  │
+  ├─ 1. Init ─────── Generate session ID, reset state, create SQLite record
+  │                   Assign creative names (e.g. ada.reviewer, fern.critic)
+  │                   Register agents in transcript bus
+  │                   Emit: session_start
+  │
+  ├─ 2. Spawn ────── Phase A — spawn agents in parallel:
+  │   (Turn 0)          Build system prompt (role, agent list, turn budget)
+  │                     Spawn Claude subprocess: claude -p --session-id <uuid>
+  │                     Log user→agent prompt delivery, collect response
+  │                     On failure: emit error, mark agent dead
+  │                   Phase B — process all collected responses:
+  │                     Parse each: extract @mentions → queue, notes → transcript
+  │                     Emit: message (per routed msg + notes)
+  │                   Emit: turn_complete (once, after all agents)
+  │
+  ├─ 3. Route ────── while (turn ≤ maxTurns && !stopped):
+  │   (Turn 1..N)     Check timeout → endSession('timeout')
+  │                   Check empty queue → endSession('converged')
+  │                   Dequeue all pending messages, grouped by recipient
+  │                   For each recipient agent in parallel:
+  │                     Check ping-pong detection → skip if cycling
+  │                     Build prompt: "@sender says: content" (+ deadline warnings)
+  │                     Resume Claude session: claude -p -r <uuid>
+  │                     Parse response → route @mentions to queue, log notes
+  │                     On failure: emit error, mark agent dead
+  │                   Emit: turn_complete (once, after all recipients)
+  │
+  └─ 4. End ──────── Reason: converged | max_turns | timeout | stopped | error
+                      Persist status + end reason, emit session_end, close EventChannel
+```
+
+**Key behaviors:**
+- Turn 0 is two-phase: spawn all agents first, then parse and route all responses together
+- `@all` expands to individual messages for every other agent
+- `@user` messages are logged and emitted but not routed (displayed by CLI consumers)
+- Lines without `@mention` are classified as working notes — persisted but not routed
+- Deadline warnings are injected at `maxTurns - 1` (warning) and `maxTurns` (final)
+- Ping-pong detection uses pair-based counters with per-turn decay (halved each turn)
+- Errors and guardrail triggers emit events and may mark agents dead or end the session
+
+### Architecture
+
+- **Orchestrator-driven**: `Orchestrator` in `src/agentic/orchestrator.ts` runs the main loop — spawns agents, routes messages, enforces guardrails, and emits events
+- **Claude-only backend** currently — spawn via `claude -p --session-id <uuid>`, resume via `claude -p -r <uuid>`
+- **SessionManager** (`src/agentic/session.ts`) wraps Claude subprocesses with UUID-based session IDs. Dispatch checks backend identity; other native-session backends are rejected instead of substituted. The transcript-replay scaffolding has no working agentic adapters yet.
+- **In-memory MessageQueue** (`src/agentic/queue.ts`) handles runtime message routing between agents
+- **SQLite TranscriptBus** (`src/agentic/bus.ts`) provides append-only persistence using better-sqlite3; DB at `~/.config/phone-a-friend/agentic.db`
+- **EventChannel** (`src/agentic/events.ts`) is an `AsyncIterable` bridge that streams `AgenticEvent` discriminated unions to CLI, TUI, and other consumers
+
+Timeout and explicit stop abort in-flight calls. On POSIX, PaF sends TERM to its owned process groups, escalates to KILL after 250ms, and waits for child close before ending the event stream. Only convergence without agent errors is `completed`; timeouts, pending work at the turn cap and child failures are `failed`, and explicit stops are `stopped`. The persisted `end_reason` distinguishes these outcomes. CLI exit is nonzero for every incomplete run. Partial failed output is retained as notes and is not routed.
+
+Agentic sandbox settings are Claude tool policies, not OS isolation. Read-only exposes read/search tools; workspace-write adds Edit/Write; danger-full-access skips permission prompts. Initial and resumed calls receive the same tool policy, model and recursion restrictions.
+
+### Agent naming & message routing
+
+- Agent names get creative prefixes via `src/agentic/names.ts`: e.g., `ada.reviewer`, `fern.critic`
+- Messages use `@name:` at line start for routing (parsed by `src/agentic/parser.ts`)
+- Lines without `@mention` are working notes — logged to the transcript bus but not routed
+- System prompt is injected per-agent with role, agent list, and turn budget (built by `buildSystemPrompt()` in `src/agentic/parser.ts`)
+
+### Guardrails
+
+All defaults are in `AGENTIC_DEFAULTS` (`src/agentic/types.ts`):
+
+| Guard | Default | Description |
+|-------|---------|-------------|
+| `maxTurns` | 20 | Hard cap on total conversation turns |
+| `timeoutSeconds` | 900 (15 min) | Session wall-clock timeout |
+| `pingPongThreshold` | 6 | Detects agents bouncing messages without progress |
+| `noProgressThreshold` | 2 | Stops session when no meaningful output is produced |
+| `maxMessageSize` | 50 KB | Per-message size limit (not yet enforced) |
+| `maxAgentTurnsPerRound` | 3 | Max turns a single agent gets before yielding (not yet enforced) |
+
+## CLI Contract
+
+After `npm install -g @freibergergarcia/phone-a-friend`, the `phone-a-friend` command is available globally. From the repo root, `./phone-a-friend` also works.
+
+```bash
+# Relay
+phone-a-friend --to codex --repo <path> --prompt "..."
+phone-a-friend --to antigravity --repo <path> --prompt "..." --sandbox read-only
+phone-a-friend --to claude --repo <path> --prompt "..."
+phone-a-friend --to gemini --repo <path> --prompt "..."
+phone-a-friend --to ollama --repo <path> --prompt "..." --model qwen3
+phone-a-friend --to opencode --repo <path> --prompt "..." --model qwen3-coder  # Local agentic (OpenCode + Ollama)
+phone-a-friend --prompt "..."               # Uses default backend from config
+phone-a-friend --to claude --prompt "..." --stream     # Stream tokens as they arrive
+phone-a-friend --to claude --prompt "..." --no-stream  # Disable streaming (batch mode)
+phone-a-friend --to claude --prompt "..." --review     # Review mode (diff-scoped)
+phone-a-friend --to claude --prompt "..." --peer-messaging accept --session coordinator # Unattended cross-session coordination
+phone-a-friend --to codex --review                     # Review mode (--prompt optional, defaults to generic review)
+phone-a-friend --to opencode --review                  # Review with local model (reads repo via tools)
+phone-a-friend --to codex --review --review-scope working-tree # Review staged, unstaged, and untracked files
+phone-a-friend --to codex --review --review-scope all          # Review branch commits plus working-tree changes
+phone-a-friend --to codex --prompt "..." --base develop # Review against specific branch
+phone-a-friend --prompt "..." --context-file notes.md  # Attach file as extra context
+phone-a-friend --prompt "..." --context-file plan.md --context-file review.md  # Several files, in order, separated by `--- <name> ---` lines
+phone-a-friend --prompt "..." --context-text "..."     # Inline extra context
+phone-a-friend --prompt "..." --include-diff           # Append git diff to prompt
+phone-a-friend --prompt "..." --no-include-diff        # Do not append git diff, overriding defaults.include_diff
+phone-a-friend --to codex --prompt "..." --quiet       # Run silently, save result to job store
+phone-a-friend --to codex --review --no-task-history   # Skip the local task record for this run
+phone-a-friend --to claude --prompt "..." --schema '{"type":"object"}'  # Structured JSON output
+phone-a-friend --to codex --review --verdict-json                       # Opinionated verdict envelope (JSON: ship/iterate/abstain + findings)
+phone-a-friend --to codex --review --verdict-json --prompt "focus on auth"  # Verdict envelope scoped to a specific review focus
+phone-a-friend --to codex --prompt "..." --session my-review           # Start or resume a PaF-managed session
+phone-a-friend --to codex --prompt "..." --backend-session 019dd45f-... # Attach to a raw backend thread (no PaF persistence)
+phone-a-friend --to codex --prompt "..." --session adopt --backend-session 019dd45f-...  # Adopt a backend thread under a PaF label
+phone-a-friend --to opencode --prompt "..." --fast                     # Fast mode (--pure for OpenCode 1.x; no effect on 2.x)
+phone-a-friend --to pi --repo <path> --prompt "..." --fast             # Local model through pi (provider from [backends.pi]; --fast = -nc -ns)
+phone-a-friend --to pi --prompt "..." --session local-review           # pi session kept in PaF's own pi session directory
+phone-a-friend --to grok --repo <path> --prompt "..."              # Grok Build; native sessions, schemas, streaming; --fast is a no-op
+
+# Setup & diagnostics
+phone-a-friend setup                        # Interactive setup wizard
+phone-a-friend doctor                       # Health check (human-readable)
+phone-a-friend doctor --json                # Health check (machine-readable)
+
+# Configuration
+phone-a-friend config init                  # Create default config
+phone-a-friend config show                  # Show resolved config
+phone-a-friend config paths                 # Show config file paths
+phone-a-friend config set <key> <value>     # Set a value (dot-notation)
+phone-a-friend config get <key>             # Get a value
+phone-a-friend config edit                  # Open in $EDITOR
+
+# Plugin management
+phone-a-friend plugin install --claude      # Install as Claude plugin
+phone-a-friend plugin install --opencode    # Install OpenCode commands and skills
+phone-a-friend plugin install --codex       # Install Codex plugin (skills + marketplace registration)
+phone-a-friend plugin install --codex --no-codex-cli-sync  # Skip the codex plugin marketplace shell-out (loose-file install only)
+phone-a-friend plugin install --pi          # Install pi skills (loose files under pi's agent directory; used as /skill:<name>)
+phone-a-friend plugin install --grok        # Install Grok skills into ~/.grok/skills
+phone-a-friend plugin install --all         # Install all host integrations
+phone-a-friend plugin install --github      # Switch to GitHub marketplace (npm source, replaces local symlink)
+phone-a-friend plugin update --claude       # Update Claude plugin (repoints a stale marketplace registration PaF made)
+phone-a-friend plugin update --claude --force-marketplace-sync  # Repoint any other registration (checkout, fork, missing folder)
+phone-a-friend plugin update --opencode     # Update OpenCode commands and skills
+phone-a-friend plugin update --codex        # Update Codex plugin
+phone-a-friend plugin update --pi           # Update pi skills
+phone-a-friend plugin update --grok         # Update Grok skills
+phone-a-friend plugin uninstall --claude    # Uninstall Claude plugin
+phone-a-friend plugin uninstall --opencode  # Uninstall OpenCode commands and skills
+phone-a-friend plugin uninstall --codex     # Uninstall Codex plugin (removes plugin registration + skills, plus any stale paf-* subagent symlinks)
+phone-a-friend plugin uninstall --pi        # Uninstall pi skills
+phone-a-friend plugin uninstall --grok      # Uninstall Grok skills (PaF-owned copies only)
+
+# Job management
+phone-a-friend job status                  # List all tracked jobs
+phone-a-friend job status --json           # List as JSON
+phone-a-friend job result <id>             # Show output of a completed job
+phone-a-friend job cancel <id>             # Mark a running/pending job as cancelled
+
+# Task tracking (every relay/review is recorded unless task_history is off)
+phone-a-friend task list                   # Newest tracked tasks across repositories
+phone-a-friend task list --repo . --json   # Tasks for this worktree, machine-readable
+phone-a-friend task show <id>              # Scope, session, drift, and event log (id prefix accepted)
+phone-a-friend task result <id>            # Stored result; exit 3 while running, 1 when failed/interrupted
+phone-a-friend task status-line            # One row for a Claude Code status line (reads the status line JSON on stdin)
+phone-a-friend task delete <id>            # Remove one task and its events
+phone-a-friend task prune --older-than 30  # Drop tasks older than N days (--all drops everything)
+```
+
+```bash
+# Agentic mode
+phone-a-friend agentic run --agents role:backend,... --prompt "..."
+phone-a-friend agentic run --agents reviewer:claude,critic:claude --prompt "Review auth" --max-turns 15
+phone-a-friend agentic run --agents sec:claude --prompt "Audit" --timeout 600 --sandbox workspace-write
+phone-a-friend agentic logs
+phone-a-friend agentic logs --session <id>
+phone-a-friend agentic replay --session <id>
+```
+
+Backward-compatible aliases: `install`, `update`, `uninstall` still work.
+
+### Interactive TUI
+
+```bash
+phone-a-friend                                # Launches TUI dashboard (TTY only)
+```
+
+No-args in a TTY launches a full-screen Ink (React) dashboard with 5 tabs:
+- **Status** — system info + live backend detection (auto-refreshes)
+- **Backends** — navigable backend list with detail pane
+- **Config** — inline config editing with focus model (nav/edit modes)
+- **Actions** — async-wrapped actions (re-detect, reinstall host integrations, open config)
+- **Agentic** — session browser with list view
+
+A persistent plugin status bar sits between the tab bar and panel content,
+showing Claude, OpenCode, Codex, pi, and Grok host integration state. It updates instantly after
+install/uninstall actions complete.
+
+TTY guard: non-interactive terminals fall back to help/setup nudge.
+Global keys: `q` quit, `Tab`/`1-5` switch tabs, `r` refresh detection.
+
+## Running Tests
+
+```bash
+npm test                  # vitest run
+npm run typecheck         # tsc --noEmit
+npm run build             # tsup (rebuilds dist/)
+claude plugin validate --strict mods/paf-tasks   # the paf-tasks mod (Claude Code 2.1.287+)
+claude plugin test mods/paf-tasks                # its own tests; vitest does not run them
+```
+
+## Versioning
+
+- Source of truth: `version` in `package.json`
+- Must keep in sync: `.claude-plugin/plugin.json` `version` field (CI enforces this), and `mods/paf-tasks/.claude-plugin/plugin.json` (`tests/paf-tasks-mod.test.ts`; `scripts/bump-version.mjs` and the auto-bump workflow update it)
+- Runtime access: reads `package.json` via `src/version.ts`
+- CLI: `phone-a-friend --version`
+- **Auto-bump**: version is bumped automatically after merge based on PR labels
+- **Auto-release**: merging to `main` with a new version automatically creates a git tag and GitHub Release
+- **npm publish**: after auto-release, publish to npm with `npm publish` (manual step, requires `npm login`)
+
+### PR labels
+
+**Every PR must have exactly one version label: `patch`, `minor`, or `major`.** The `label-check` CI job enforces this. Do NOT modify version fields in `package.json` or `.claude-plugin/plugin.json` manually — they are bumped automatically on merge by the `auto-bump` workflow.
+
+- **`patch`**: bug fixes, docs, CI changes, refactoring
+- **`minor`**: new features, new CLI flags, new backends
+- **`major`**: breaking changes to CLI contract or relay API
+
+### Branch naming convention
+
+Labels are auto-applied by the `auto-label` workflow when a PR is opened, based on the branch name prefix:
+
+| Prefix | Label |
+|--------|-------|
+| `fix/`, `bugfix/` | `patch` |
+| `chore/`, `docs/`, `ci/`, `refactor/` | `patch` |
+| `feat/`, `feature/` | `minor` |
+| `breaking/` | `major` |
+
+Unrecognized prefixes get no label — the contributor must add one manually. `label-check` blocks merge until a label is present.
+
+Local manual bump (if needed): `npm run bump:patch`, `npm run bump:minor`, `npm run bump:major`
+
+## Build
+
+`dist/` is committed to git for symlink plugin installs. It must stay self-contained (runs without `node_modules/`). CI verifies this.
+
+After changing source: `npm run build && git add dist/`
+
+### Testing host skills against a checkout
+
+Two indirections mean a fresh Claude session does not automatically run a checkout:
+
+- Skills resolve the binary with `command -v phone-a-friend`, so `PATH` must point at the checkout. `npm link` from the repo root does that (reversible with `npm install -g @freibergergarcia/phone-a-friend`). `phone-a-friend doctor` reports a PATH mismatch when it does not.
+- `.claude-plugin/marketplace.json` sources the plugin from **npm**, so `plugin install --claude` from a checkout still installs the published skill text (verified: after installing from a 4.4.1 checkout, the cache held 4.4.0 without the new sections). Use `claude --plugin-dir <checkout>` to load `commands/` and `skills/` from disk for one session; it overrides the installed marketplace copy of the same plugin name. `claude plugin validate .` checks the layout.
+
+## Directory packages
+
+`npm run plugins:sync` generates `plugins/claude/` and `plugins/phone-a-friend/` from canonical manifests, skills, host-specific commands/overlays and `docs/distribution/plugin-readme.md`. Supporting `references/`, `scripts/` and `assets/` are included; generated folders must not be edited directly. `npm run plugins:check` detects drift and validates local submission constraints. `npm run plugins:pack` writes complete Claude/Codex ZIPs and checksums under ignored `artifacts/plugins/` (requires the `zip` utility). Release CI attaches them to the GitHub release. Local validation is not vendor approval.
+
+## Doctor diagnostics
+
+Doctor adds executable/version and configured-model information without changing
+backend readiness exit codes. JSON keeps the existing CLI/local/host structure;
+capabilities are marked `declared-only`, and backend-reported models remain
+unknown because doctor runs no inference. Version probes have time/output limits
+and use fixed failure classifications. The local Ollama CLI is a client identity,
+not the HTTP server version used by a relay.
+
+For pi, doctor also prints the configured `[backends.pi] provider` (JSON:
+`model.provider`, present only on the pi entry) and adds an advisory when the
+installed pi is older than 0.79.0. It probes no model endpoint: that would couple
+PaF to pi's `models.json`, and doctor promises no inference.
+
+For Grok, doctor treats a missing binary as optional, with no version floor. When `grok` is on `PATH`, it adds an advisory that `--fast` has no effect for `--to grok` and that a relay still loads project instructions through `--cwd`. It probes no model endpoint.
+
+## Configuration
+
+Config files (TOML format):
+- User: `~/.config/phone-a-friend/config.toml`
+- Repo: `.phone-a-friend.toml` (optional, merges over user config)
+
+Precedence: CLI flags > env vars > repo config > user config > defaults
+
+Environment variables:
+- `PHONE_A_FRIEND_INCLUDE_DIFF=false` — overrides `defaults.include_diff = true` from config without needing `--no-include-diff` on every call. The OpenCode shims in `skills/<name>/COMMAND.opencode.md` use this env var instead of the `--no-include-diff` flag because the flag was added in v2.2.0+ but the env var works on every shipped binary (v1.7.2+). Rich content (`commands/<name>.md` and `skills/<name>/SKILL.md`) uses a probe-and-gate pattern that prefers the explicit flag when available and falls back to this env var on stale CLIs.
+- `PHONE_A_FRIEND_CLAUDE_PEER_MESSAGING=native|accept|refuse` — overrides `backends.claude.peer_messaging`. `native` exposes `ListAgents`/`SendMessage` while respecting Claude's inbound rules; `accept` enables unattended inbound delivery; `refuse` disables both directions.
+- `PHONE_A_FRIEND_HOST=opencode|codex|pi|grok` — recursion guard marker. Install shims set this so that `--to <host>` from inside that host's session is blocked deterministically. `opencode` blocks `--to opencode`; `codex` blocks `--to codex`; `pi` blocks `--to pi` (pi has no shim; as a host it needs no marker, because pi sets `PI_CODING_AGENT=true` for the commands its `bash` tool runs and PaF honours that); `grok` blocks `--to grok`. Grok also sets `GROK_AGENT=1` on every child, and PaF treats that as the Grok host even when the skill marker is missing. Skills still set `PHONE_A_FRIEND_HOST=grok`. Only relevant when invoking PaF programmatically; the slash-command shims handle it automatically.
+- `PHONE_A_FRIEND_DEPTH` — relay depth guard (already documented in Core Behavior).
+- `PHONE_A_FRIEND_UPDATE_CHECK=false` — disable npm update notifications. Equivalent to `defaults.update_check = false` in TOML config. The env var takes precedence.
+- `PHONE_A_FRIEND_TASK_HISTORY=results|metadata|off` — overrides `defaults.task_history` (see "Task tracking"). `--no-task-history` skips the record for one run and wins over both.
+
+pi configuration:
+
+```toml
+[backends.pi]
+provider = "mlx"                             # a provider from pi's models.json
+model = "mlx-community/Qwen3.5-9B-MLX-4bit"   # --model overrides it
+```
+
+`provider` must be a non-empty string when set; without it PaF passes `--model`
+unchanged (pi accepts `provider/id` in one string), and with neither pi uses its
+own default. PaF never starts a model server.
+
+Claude peer messaging configuration:
+
+```toml
+[backends.claude]
+peer_messaging = "native" # native (default), accept, or refuse
+```
+
+The per-call override is `--peer-messaging <mode>` and is valid only with
+`--to claude`. PaF requires Claude Code 2.1.224+ for `accept`; older versions
+keep the legacy isolated tool surface in `native` mode. Peer-enabled workers
+are named `paf-<session-label>` (or `paf-relay` without `--session`) so other
+Claude sessions can target them predictably.
+
+## Update notification
+
+`src/updates.ts` polls `dist-tags.latest` for `@freibergergarcia/phone-a-friend` from the npm registry, caches the result at `~/.config/phone-a-friend/update-check.json`, and prints a one-line stderr banner on the next interactive run when a newer stable version exists.
+
+- **Notification only**, no self-update. The CLI never modifies the installed npm package.
+- **Cache-driven**: the running invocation reads the cache to decide whether to print the banner. A background refresh kicks off via `setImmediate(...).unref()` with a 5s `AbortController` timeout, so short commands like `--version` exit promptly.
+- **Cooldowns**: 24h between registry fetches, 7d before re-showing the same version's banner.
+- **Suppression**: stderr-only banner; suppressed for `--quiet`, `--schema`, `--verdict-json`, any `--json` subcommand flag, non-TTY stdout/stderr, `CI=true`, `TERM=dumb`, `defaults.update_check=false`, or `PHONE_A_FRIEND_UPDATE_CHECK=false`.
+- **Atomic cache writes**: temp file + `fsync` + rename + parent-dir `fsync`. Corruption is recovered by rotating the bad file aside and starting fresh, no data loss because the file is regenerable.
+- **First run**: never shows a banner. It records the first registry result so the banner can appear on the second run earliest.
+- **Doctor**: `phone-a-friend doctor` surfaces the current cache path, last checked timestamp, latest known version, and config opt-in state. The same fields appear under `updateCheck` in `doctor --json` output.
+
+The pure decision logic (`decideBanner`) is testable in isolation in `tests/updates.test.ts`; CLI wiring lives in `src/cli.ts` (`setupUpdateCheck` + `maybeShowUpdateBanner`).
+
+## Marketplace distribution
+
+### Claude marketplace registration (read before touching the installer)
+
+> [!IMPORTANT]
+> `claude plugin marketplace add` is idempotent on the marketplace **name**: a
+> second add from a different source prints `Marketplace '<name>' already on
+> disk`, exits 0 and keeps the first source (Claude Code CLI reference). Before
+> this was handled, PaF reported `claude_cli_marketplace_add: ok` while Claude
+> kept reading an old folder, so later plugins such as `paf-tasks` were missing
+> and nothing said so.
+
+`syncClaudeMarketplace()` in `src/installer.ts` compares sources itself:
+
+| Registered vs this install | What `plugin install/update --claude` does |
+|---|---|
+| Not registered, or the same source | Regular add, update, install, enable, update |
+| A folder PaF can prove it made: this install's folder, or another `node_modules` install whose `package.json` is PaF's (a previous Node version) | Repoints automatically |
+| Anything else: a checkout, a fork, a missing folder, another remote | Leaves it, prints the source and the fix: `--force-marketplace-sync` |
+
+- **Source per install.** An npm-style install (any path with a `node_modules`
+  segment) registers `freibergergarcia/phone-a-friend` from GitHub, because its
+  folder moves with every nvm/fnm/Homebrew Node change. A checkout registers its
+  own folder, so local edits load in place. `plugin install --github` always
+  registers GitHub and repoints a folder registration.
+- **Repoint = remove, add, reinstall.** Claude has no "change source", and
+  `marketplace remove` uninstalls the marketplace's plugins. The repoint first
+  reads every install of `phone-a-friend` and `paf-tasks` from
+  `installed_plugins.json` (all scopes; project scopes are reinstalled with that
+  project as the working directory), and restores them after the add. If the add
+  fails (GitHub needs `git` and the network), the previous folder is re-added
+  and the plugins reinstalled.
+- **paf-tasks updates.** The regular sync installs and updates only
+  `phone-a-friend`. After it, every recorded `paf-tasks` install (from
+  `installed_plugins.json`, each project scope from its own folder) gets
+  `claude plugin update`, except ones a repoint just reinstalled. Claude Code
+  leaves auto-update off for third-party marketplaces, so without this the
+  panel stayed on its first-installed version.
+- **Ownership record.** A successful registration writes
+  `<PaF config dir>/claude-marketplace.json`. Uninstall's `auto` mode removes a
+  remote marketplace only when it matches that record, so a GitHub marketplace
+  the user added by hand is still left alone.
+- **`CLAUDE_CONFIG_DIR`.** `claudeConfigRoot()` resolves an explicit home, then
+  `CLAUDE_CONFIG_DIR`, then `~/.claude`. The `claude` CLI PaF spawns inherits the
+  variable, so the registry PaF reads must come from the same place.
+- **Doctor** prints an advisory when the registered source differs from this
+  install's (`claudeMarketplaceAdvisory()`), naming the fix command.
+- **Not handled:** Codex's marketplace registration has the same add-by-name
+  behavior (`syncCodexPluginRegistration`); its npm installs already register
+  GitHub (`codexMarketplaceSource`), so only checkout registrations can go stale
+  there. Its replace/remove semantics are unverified.
+- Tests: `tests/installer.test.ts` ("Claude marketplace source and stale
+  registrations") stubs `CLAUDE_CONFIG_DIR` and `XDG_CONFIG_HOME` for every
+  test, so the suite never reads or writes the real Claude or PaF config.
+
+### Installing from the marketplace
+
+Users can install the Claude Code plugin (commands and skills) via the marketplace:
+
+    /plugin marketplace add freibergergarcia/phone-a-friend
+    /plugin install phone-a-friend@phone-a-friend-marketplace
+
+The marketplace manifest at `.claude-plugin/marketplace.json` points to the npm
+package `@freibergergarcia/phone-a-friend`. Claude Code fetches and caches the
+plugin from npm when users install through the marketplace.
+
+Marketplace install provides Claude Code integration only (slash commands and skills).
+For the full CLI (agentic mode and TUI dashboard), users
+still need `npm install -g @freibergergarcia/phone-a-friend`.
+
+The marketplace lists a second plugin, `paf-tasks`: the Claude Code mod in
+`mods/paf-tasks/` (review panel, conversation rows, spinner, band). It is opt-in
+(`/plugin install paf-tasks@phone-a-friend-marketplace`), and nothing in PaF
+installs it. Choices behind that, keep them in a rewrite:
+
+- **Its own plugin, never part of `phone-a-friend`.** Its `userConfig` uses
+  `options`, which Claude Code before 2.1.271 refuses as an invalid manifest, and
+  mods need 2.1.287+. Verified with 2.1.260: the panel plugin fails to load while
+  the `phone-a-friend` plugin in the same session keeps its skills. Merged, the
+  whole plugin would fail for those users, and everyone who updates would get a
+  self-opening panel unasked.
+- **Relative-path source** (`./mods/paf-tasks`): an npm plugin source cannot
+  name a subfolder. It resolves for a marketplace added from GitHub (main branch)
+  and for one `plugin install --claude` registers from a checkout folder. `mods/`
+  stays in the npm `files` list for registrations older PaF versions made from
+  the installed package folder.
+- **Boundary rule.** The mod lists tasks only with `task list --repo <worktree>`
+  for worktrees of the session's repository, confirmed with
+  `git rev-parse --git-common-dir` before and after each listing; it never lists
+  the whole task store. Outside git it lists nothing.
+- Needs the CLI on `PATH` (4.5.0+ for `task list --repo`); it says so in the
+  panel when the CLI is missing or too old.
+
+OpenCode has no marketplace. `phone-a-friend plugin install --opencode` copies or symlinks the supported OpenCode skills (`phone-a-friend`, `curiosity-engine`) and their corresponding command shims into `~/.config/opencode/skills/` and `~/.config/opencode/commands/`, honoring `$XDG_CONFIG_HOME`. It also removes legacy `phone-a-team` OpenCode artifacts because `/phone-a-team` is supported in Claude Code, Codex, and Grok, not OpenCode.
+
+The OpenCode command source uses **overlay inversion**: `installer.ts` `opencodeCommandSource()` prefers `skills/<name>/COMMAND.opencode.md` (the OpenCode-tuned thin shim, env-var-only diff suppression, `PHONE_A_FRIEND_HOST=opencode` prefix) when it exists, and falls back to the rich `commands/<name>.md` only when no overlay is shipped for that skill. This keeps the rich content host-neutral for Claude consumption while letting OpenCode ship a host-tuned shim per skill. Today both shared skills (`phone-a-friend`, `curiosity-engine`) ship overlays.
+
+pi is a host as well as a backend. `phone-a-friend plugin install --pi` copies or symlinks the host-neutral `phone-a-friend` and `curiosity-engine` skills into `<agent-dir>/skills/`, where `<agent-dir>` is `PI_CODING_AGENT_DIR` (normalized like pi's `normalizePath`: `~`, `file://` URLs and, on Windows, `~\` and shell drive paths) or `~/.pi/agent`. Every choice follows pi's own docs (`docs/skills.md`, `configuration.md`, `packages.md` in the pi package):
+
+- **No command shim.** pi exposes each skill as `/skill:<name> <args>`, interactively and as the prompt of a one-shot run. `$ARGUMENTS` is not substituted; the arguments arrive as the user request after the skill text, and the skills say so.
+- **No pi shell-out.** The installer writes files only. `~/.agents/skills/` is not used, because Codex and other agents read it too.
+- **Also a pi package.** `package.json` carries a `pi` manifest that pins the same two skills (and no extensions, prompts or themes), so `pi install npm:@freibergergarcia/phone-a-friend` is the docs-native alternative. `isPiInstalled()` counts either path: the loose skills, or a PaF entry under `packages` in `<agent-dir>/settings.json`. Recognized sources are an `npm:` spec (pi's own spec pattern) and a local path whose `package.json` is PaF's. A git-source package is deliberately not recognized: pi resolves those with hosted-git-info, and imitating that parser was wrong in a new way on every review pass, so doctor shows "not installed" for a git install. PaF does not evaluate pi's filter language, so an entry with a `skills` filter or `autoload: false` does not count: the status errs towards "not installed". `tests/pi-package-manifest.test.ts` keeps the manifest, the installer and the shipped files in agreement. The `pi-package` keyword opts the next npm release into the official pi catalog; indexing must be verified after publication.
+- **No `/phone-a-team`** (no team mechanics in pi) and no host marker: pi sets `PI_CODING_AGENT=true` for its shell commands, which the recursion guard reads.
+- **Local host models need the explicit command.** Verified with pi 0.99.1: `/skill:phone-a-friend ask claude ...` ran the right relay on a 35B and a 9B local model, and `/skill:curiosity-engine` ran a round on the 35B. Without the command, the 35B model did not load the skill and guessed CLI flags. The README tells users to use the `/skill:` form.
+- **Uninstall is ownership-checked**, unlike the OpenCode and Codex uninstallers: users explicitly run `plugin uninstall --pi` or `plugin uninstall --all` before removing the CLI, and may keep a skill of their own under the same name. Removed: a copy carrying the `.phone-a-friend-install` marker (written on copy installs only, never into the source), a symlink to exactly `<this install>/skills/<name>`, or a symlink to `<dir>/skills/<name>` where `<dir>/package.json` names PaF's npm package (another checkout or an older global install). Anything else is reported as `kept`, including a dangling symlink from another location: the path's shape alone proves nothing. A symlink to some other place inside the repository is the user's too. Install relinks a PaF-owned symlink without `--force` (a new install location after a Node upgrade); anything else in the way needs the flag. `--force` on install still replaces whatever is there, as for every host.
+- `--all` includes pi. There are no npm uninstall lifecycle hooks: package removal preserves configuration and history but does not remove host integrations. Symlink installs (the default) are left pointing at the removed package, so run `plugin uninstall --all` (or `pi remove` for a pi package install) before `npm uninstall -g`.
+
+Grok is a host as well as a backend. `phone-a-friend plugin install --grok` copies or symlinks the host-neutral `phone-a-friend` and `curiosity-engine` skills into `~/.grok/skills/` (`grokConfigRoot()`, overridable with `grokHome` in tests). There is no command shim, no Grok shell-out, and no marketplace package. `phone-a-team` comes from `skills/phone-a-team/.grok/SKILL.md`, a Bash round loop with default friends `claude,gemini` and Grok synthesis. `isGrokInstalled()` is true only when all three skills are PaF-owned: a copy carrying the `.phone-a-friend-install` marker, a symlink into this install's `skills/<name>`, or a symlink to another PaF package's `skills/<name>` or `.grok` / `.codex` overlay, verified through that package's `package.json`. A directory that merely contains `SKILL.md` does not count, and a Claude plugin Grok can see does not count. Uninstall removes only a PaF-owned copy and reports anything else as `kept`. `--all` includes grok. `--github` rejects `--grok`. The skill text tells a Grok host to set `PHONE_A_FRIEND_HOST=grok` and never pass `--to grok`.
+
+Codex is shipped as a real Codex plugin (the marketplace + manifest live in the repo) AND via loose-file install for content delivery.
+
+`phone-a-friend plugin install --codex` does two things:
+
+1. **Loose-file skill install.** Copies or symlinks the three Codex skills (`phone-a-friend`, `curiosity-engine`, `phone-a-team`) into `$CODEX_HOME/skills/` (defaulting to `~/.codex/skills/`). Codex auto-discovers SKILL.md files from this path. Earlier versions also installed `paf-*.toml` subagent personas under `$CODEX_HOME/agents/`; that design was dropped (see "Why no subagents" below) and the install path cleans up any stale paf-* symlinks left over from prior PaF versions.
+2. **Marketplace registration.** When `codex` is in PATH, shells out to `codex plugin marketplace add <repo>` followed by `codex plugin add phone-a-friend@phone-a-friend-marketplace`. This registers PaF in Codex's `/plugins` UI and `codex plugin list`. Pass `--no-codex-cli-sync` to skip this step.
+
+Either path delivers the skills on its own. Codex marketplace install fetches the full plugin tree at the `source.path` (`./plugins/phone-a-friend/`) into `~/.codex/plugins/cache/...` and auto-discovers SKILL.md files under the directory declared by `skills:` in the per-plugin `plugin.json`. The loose-file install is the no-marketplace fallback for users on stale Codex CLI versions or who skip CLI sync with `--no-codex-cli-sync`.
+
+Manifest layout:
+
+| File | Purpose |
+|---|---|
+| `.codex-plugin/plugin.json` | Root per-plugin manifest, symmetric with `.claude-plugin/plugin.json` |
+| `plugins/phone-a-friend/.codex-plugin/plugin.json` | Subdir per-plugin manifest consumed by Codex's marketplace install (Codex requires plugins to live in a subdir of the marketplace, not at root). Declares `"skills": "./skills/"`. |
+| `plugins/phone-a-friend/skills/<name>/SKILL.md` | Skill content shipped via marketplace install. Synced from `skills/<name>/{,.codex/}SKILL.md` by `scripts/sync-codex-plugin.mjs` (runs on `npm run build`; CI test enforces no drift). |
+| `.agents/plugins/marketplace.json` | Codex marketplace manifest listing PaF with `source: { source: "local", path: "./plugins/phone-a-friend" }` |
+| `skills/phone-a-team/.codex/SKILL.md` | Codex-tuned `/phone-a-team` orchestration (Bash-driven round loop, no subagent spawn). Source of truth, mirrored into `plugins/phone-a-friend/skills/phone-a-team/SKILL.md` by the sync script. |
+
+All four plugin manifests (`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `plugins/phone-a-friend/.codex-plugin/plugin.json`, `plugins/claude/.claude-plugin/plugin.json`) must share `version` with `package.json`. The manifest tests, distribution tests and `plugins:check` enforce this in CI.
+
+Codex uses a parallel overlay convention: `installer.ts` `codexSkillSource()` prefers `skills/<name>/.codex/SKILL.md` (Codex-tuned variant in a dotfile subdirectory so it doesn't appear in other hosts' skill scans) when present, and falls back to `skills/<name>/SKILL.md` otherwise. Today `phone-a-team` ships only the `.codex/` overlay (no host-neutral SKILL.md) so OpenCode does not pick it up. `phone-a-friend` and `curiosity-engine` ship a single host-neutral SKILL.md used by both OpenCode and Codex.
+
+### Why no subagents
+
+PaF's Codex skills orchestrate backend CLI calls through Bash, so natural-language
+requests such as "ask Claude and Gemini" do not depend on spawning Codex personas.
+This is PaF's integration choice, not a universal limit on Codex: delegation also
+depends on the host's instructions and reasoning mode. See the current
+[Codex subagent guidance](https://learn.chatgpt.com/docs/agent-configuration/subagents).
+Legacy `paf-*` personas are not installed; the installer removes stale symlinks.
+
+### Agent Teams and the paf-reviewer subagent
+
+`/phone-a-team` (Claude only) uses current Agent Teams mechanics: no `TeamCreate`/`TeamDelete` (removed in Claude Code 2.1.178); a teammate launches when the lead calls the Agent tool with a `name` while `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is set; cleanup is automatic at session end and shutdown is a natural-language `SendMessage` per worker. Teammates inherit the lead's permission mode and cannot run background Bash, so workers run relays in the foreground. When teams are unavailable (env var unset, `-p` mode, no `name` parameter on the Agent tool) the command degrades to direct relays. `tests/skill-files.test.ts` pins this contract.
+
+`agents/paf-reviewer.md` is a plugin subagent (`phone-a-friend:paf-reviewer`, background, `Bash` + `Read`, sonnet). `/phone-a-friend` on a Claude host delegates reviews to it with `run_in_background: true` and no `name`, so the review shows in the agent panel and `/tasks`, its verbose output stays in the subagent's context, and the main conversation receives a receipt plus verbatim findings. A named subagent would become a teammate under agent teams and lose background Bash, hence the no-name rule. The Bash `run_in_background` path remains the fallback. `agents/` is in the npm `files` list so marketplace installs ship it.
+
+### Claude workflow boundary
+
+The Claude relay uses explicit tool lists in limited modes and disables slash
+commands plus `Task` (a supported `Agent` alias). In `danger-full-access`, it does
+not explicitly disable the separate `Workflow` surface. PaF's depth guard is not
+a guarantee against all provider-native fan-out. For an explicitly required
+workflow-free call, the caller can set `CLAUDE_CODE_DISABLE_WORKFLOWS=1` for that
+process; PaF does not set it automatically. See [Claude workflow controls](https://code.claude.com/docs/en/workflows#turn-workflows-off).
+
+## Job tracking
+
+The `--quiet` flag runs a relay without interactive output and persists the result to a job store.
+
+- `JobManager` in `src/jobs.ts` reads/writes `~/.config/phone-a-friend/jobs.json`
+- `relayBackground()` in `src/relay.ts` wraps `relay()` with job lifecycle (pending, running, completed/failed)
+- Jobs are capped at 50, oldest completed/failed/cancelled are pruned on create
+- `--quiet` keeps the process alive until the job finishes (not truly detached). For detached execution, users can combine with `nohup` or `&`.
+- `job cancel` marks the job as cancelled in the store but cannot kill the subprocess (PID tracking is not yet implemented)
+
+## Task tracking
+
+Every CLI relay and review is recorded as a task so delegated work stays findable from another terminal, after the conversation moves on, or after a host compacts its context.
+
+- `TaskStore` in `src/tasks.ts` writes `~/.config/phone-a-friend/tasks.db` (SQLite, WAL, 5s busy timeout). Separate PaF processes can write concurrently without losing records, as can the relay session store in `sessions.db`. The first open of a fresh database races on the WAL switch, which SQLite refuses with `SQLITE_BUSY` without waiting on the busy handler (issue #173); `openDatabase()` in `src/sqlite-open.ts` retries open plus pragmas plus schema (and the transcript bus's migration) with jittered backoff, used by `TaskStore` and `TranscriptBus`. Two tables: `tasks` (identity, status, backend, repo/branch/HEAD, review scope, diff hash, backend session id, owner pid, result, error, timestamps) and `task_events` (ordered evidence per task). Relay sessions import legacy JSON once; `--quiet` jobs are still written to `jobs.json` and additionally tracked as tasks.
+- `beginTrackedRun()` in `src/task-tracking.ts` is called by the CLI before every relay path (review, batch, stream, `--quiet`). It returns a `RelayObserver` for the relay core plus `complete()`/`fail()`. Tracking is best-effort: a store failure prints one stderr warning and the relay proceeds untracked.
+- The CLI prints `Task <id> started · phone-a-friend task show <id>` on stderr before the spinner and `Task <id> completed|failed` afterwards. The id is unstyled so hosts can match `Task ([0-9a-f]{8}) started`. stdout contracts (`--schema`, `--verdict-json`, plain text) are unchanged.
+- **Scope and drift.** Review mode hashes the collected diff before the backend call (`scope_captured`) and re-collects it afterwards. A different hash records `drift_detected`, prints a stderr warning, and sets `driftDetected = true`; an unchanged hash records `scope_verified`; a failed re-collection records `drift_unknown`. Backends with local file access read the live tree, so the hash is evidence of what the review covered, not a guarantee.
+- **Progress events.** Backends emit `BackendEvent`s through `onEvent`. Codex adds `--json` to `exec` and `exec review` only when a listener exists and forwards thread/turn/command/message events as they stream (`session_linked`, `turn_started`, `activity`, `message`, `turn_completed`, `turn_failed`, `error`); reasoning items are never surfaced. With JSONL active, the stdout fallback extracts the final `agent_message` instead of raw protocol lines. pi reports `activity` for each tool call, each automatic retry and each context compaction, on the batch and the stream path. Other backends emit nothing yet, so their tasks show lifecycle events only. A quiet task is not a stuck task.
+- **Status.** `queued`, `running`, `completed`, `failed`, `interrupted`. `task list|show|result` call `reconcileInterrupted()`, which marks running tasks whose owner pid is gone as `interrupted` (event `owner_lost`). Silence never changes a status; only a dead owner does. Cancellation, follow-up routing, and forks are not implemented.
+- **Retention.** `defaults.task_history` (`results` default, `metadata`, `off`), `PHONE_A_FRIEND_TASK_HISTORY`, or `--no-task-history` for one run. `results` stores the result text, a 200-character prompt preview, prompt and diff hashes, and events. `metadata` drops the preview and result text. `off` writes nothing. `task delete` and `task prune` remove PaF records only; backend-native sessions are not erased.
+- Resolution key for hosts: worktree root (`task list --repo .`), then branch, backend session id, and recency. Ids accept unique prefixes of four or more characters.
+- **Progress on stderr.** `createProgressReporter()` in `src/progress.ts` is merged with the tracking observer (`mergeObservers()` in `src/relay.ts`) on every relay path except `--quiet`. When stderr is a TTY the spinner text is updated (`Reviewing … · 00:12 Running: git diff`); otherwise one line per `activity`/`message`/`turn_failed`/`error` event is printed (`◇ 00:12 Running: git diff`), preceded by `◇ scope: …` and `◇ session: …`. Every path ends with a receipt, `◇ Task <id> completed · 23s · scope unchanged`, which keeps the `Task <id> completed|failed` marker hosts match on. Turn markers are never printed.
+- **Status line.** `task status-line` (`src/status-line.ts`) reads Claude Code's status line JSON on stdin (`workspace.current_dir`, then `cwd`), reconciles dead owners, and prints one compact row for the repository: `◇ codex review 00:45 · Running: git diff` for the most recently started running task (prefixed `N running ·` when several run), else `◇ codex review done 40s ago · tree unchanged` for a task finished within `--recent` minutes (default 2), or the failure/interruption with its error head. No brand or task id on the row; `task list` has those. Prints nothing when idle. Intended for `settings.json` `statusLine` with a `refreshInterval`; each invocation is one SQLite read.
+
+## Review scopes
+
+`--review-scope branch|working-tree|all` is valid in review mode and implies `--review` when used alone.
+
+| Scope | Diff contract |
+|---|---|
+| `branch` (default) | Committed changes from the merge base with `--base` through `HEAD` |
+| `working-tree` | Staged, unstaged, and non-ignored untracked files relative to `HEAD` |
+| `all` | Branch changes plus staged, unstaged, and non-ignored untracked files |
+
+- `--repo <path>` may point at a worktree root or any directory inside one; review mode normalizes it to the containing worktree root.
+- Before the first commit, `working-tree` and `all` compare pending files against Git's empty tree.
+- PaF collects and bounds the selected scope before any backend call. The combined diff is subject to `MAX_DIFF_BYTES`; generic diffs represent untracked binary files with a binary marker rather than embedded bytes.
+- A clean scope does not invoke a backend. Plain review returns a no-changes message; `--verdict-json` returns `abstain` with no findings.
+- Codex handles `branch` with native `--base` and `working-tree` with native `--uncommitted`. Unsupported native scopes use PaF's generic diff path.
+- `--verdict-json`, custom prompts, and schemas use the generic path and preserve the selected scope.
+- `--include-diff` is for normal relay mode and is rejected when combined with review mode; use `working-tree` or `all`.
+
+## Structured output
+
+The `--schema` flag requests JSON output matching a JSON Schema from backends that support it.
+
+- Claude: native enforcement via `--output-format json --json-schema`
+- Codex: native enforcement via `--output-schema <tempfile> --json` (schema written to temp file)
+- Antigravity: native enforcement via `--output-format json --json-schema <schema>`; PaF returns the envelope's `structured_output` as JSON text (falls back to `response` when absent) after the same status, response, print-timeout and session checks the session path runs
+- Gemini: `--output-format json` with schema injected into prompt (best-effort, not validated)
+- Ollama: native enforcement via JSON Schema object in the HTTP `format` field, with the schema also injected into the prompt for grounding
+- OpenCode CLI: schema injected into prompt (best-effort, not validated; the OpenCode SDK has a structured-output surface, but PaF's backend uses `opencode run`)
+- pi: schema injected into prompt (best-effort, not validated; pi has no structured-output flag). A small local model may answer with reasoning only, which fails closed with a hint to try `--fast` or a larger model
+- Grok: native `--json-schema` in batch mode; prefer `structured_output` when present, otherwise use the envelope text. `--verdict-json` uses the existing verdict schema and parser.
+- Streaming is disabled when `--schema` is active (structured output requires batch mode)
+- When a `--schema` is set in review mode, native `review()` is bypassed and the generic `run()` path is used so the schema is honored uniformly across backends.
+
+### Verdict envelope (`--verdict-json`)
+
+Opinionated review-mode flag that activates a built-in JSON envelope so callers (especially `/phone-a-team` and downstream skills) can decide iterate-or-stop deterministically without regexing free text.
+
+```bash
+phone-a-friend --to codex --review --verdict-json                       # branch scope (default)
+phone-a-friend --to codex --review --review-scope all --verdict-json    # all current branch/worktree changes
+phone-a-friend --to codex --review --verdict-json --prompt "auth only"  # scoped review focus
+```
+
+- Implies `--review`. Cannot be combined with `--schema` (PaF sets the schema itself; conflicting input errors out).
+- The caller's `--prompt` is preserved as the review request and combined with the canonical envelope instructions; omitting it uses a scope-specific branch, working-tree, or all-changes request.
+- The envelope shape:
+  ```json
+  {
+    "schema_version": 1,
+    "verdict": "ship" | "iterate" | "abstain",
+    "summary": "<one-paragraph synthesis>",
+    "findings": [
+      {
+        "severity": "blocker" | "important" | "nit",
+        "title": "<short headline>",
+        "rationale": "<1-3 sentences>",
+        "location": "<file or file:line> or null"
+      }
+    ]
+  }
+  ```
+- `verdict` is **derived from severities** at parse time, not trusted from the model:
+  - any `blocker` or `important` → `iterate`
+  - empty findings, or only `nit` findings → `ship`
+  - `abstain` is allowed only when findings is empty
+  - if the model's claimed verdict contradicts severities, the response is treated as malformed and PaF fails closed
+- Output: compact one-line JSON on stdout. Pipe through `jq` for human consumption.
+- On parse / validation failure: stderr emits `Verdict parse failed: <reason>` followed by the raw response wrapped in `<<<RAW_BEGIN ... RAW_END>>>` markers. PaF exits with code 2.
+- Implementation: `src/verdict.ts` (schema, prompt, parser, derived-verdict logic). The schema satisfies OpenAI's structured-output strict mode (`additionalProperties: false`, all keys listed in `required`, no unsupported keywords).
+
+## Session continuity
+
+Two flags handle session resume, with separate concerns:
+
+- `--session <label>` is a PaF-managed label. PaF stores the label and the underlying backend session ID together in `~/.config/phone-a-friend/sessions.db` and uses the label for lookup on subsequent calls.
+- `--backend-session <id>` is a raw passthrough. PaF skips the label store and resumes the backend session directly. Combine with `--session <label>` to also start tracking that backend session under a label (adoption). Adoption is idempotent: re-running the same `--session label --backend-session id` pair is fine; conflicts (same label pointing at a different backend, session id, or repo) error explicitly.
+
+Implementation notes:
+
+- `SessionStore` in `src/sessions.ts` reads/writes `~/.config/phone-a-friend/sessions.db`
+- Sessions are capped at 100, oldest by last-used are pruned on overflow
+- Claude: `--session-id` on start, `-r` on resume. UUID generated client-side.
+- Antigravity: server-assigned ID captured from `conversation_id` in `--output-format json` output; resume with `--conversation <id>`.
+- Gemini: `--session-id <uuid>` on start, `--resume <uuid>` on resume. UUID generated client-side (mirrors Claude). Never `--resume latest`, so a label always maps to one conversation.
+- Codex: thread ID captured from `thread.started` JSONL event, `codex exec resume <thread-id>`. Resume accepts neither `-C` nor `--sandbox`, so PaF passes `-c sandbox_mode="<sandbox>"` and spawns the resume with `cwd` set to the repo; without both, a thread started read-only resumes under Codex's config default and works in PaF's own cwd (verified on 0.157.1).
+- pi: `--session-dir <PaF config dir>/pi-sessions --session-id <uuid>` on start and on resume, UUID generated client-side. pi silently creates a session that is missing, so a resume is checked **before spawning**: PaF scans the directory's `*.jsonl` headers the way pi does (`id` plus `cwd`) and requires exactly one match; zero or several fail without a model call. After the run, the header pi emitted must equal the one that was checked. A plain relay passes `--no-session`, so nothing is written to pi's store.
+- Ollama: stateless replay (full history prepended to each request)
+- Grok: `resumeStrategy: 'native-session'`, `requiresClientSessionId: true`. New labels create a UUID with `--session-id`; subsequent calls use `--resume`. `executeSessionRun()` shares the session path between relay and generic review. A review with either session flag bypasses native `review()` so the flags are honored.
+- `--backend-session` is only valid for backends with `resumeStrategy: 'native-session'` (Antigravity, Codex, Claude, Gemini, OpenCode, pi, Grok). For pi it attaches only a session that lives in PaF's pi session directory; a session started directly in pi cannot be attached in this version.
+- `--session` errors out for backends with `resumeStrategy: 'unsupported'` instead of silently fresh-spawning each call. Review mode runs that check before `reviewRelay` and before task tracking. `reviewRelay` forwards session fields through `executeSessionRun()` and uses the generic review path when a session is requested.
+- An unknown `--session <label>` no longer silently fresh-spawns; PaF prints a stderr warning before starting a new session under that label
+- Streaming is disabled when `--session` or `--backend-session` is active
+
+### History persistence rule
+
+PaF only persists conversation `history` for backends whose resume mechanism actually replays it (`resumeStrategy === 'transcript-replay'` — currently only Ollama). For everything else (`native-session`, `unsupported`), the row stores metadata + `backendSessionId` and `history: []`. Existing rows that were created before this rule have their fat history trimmed on the next write to that label.
+
+Why: Codex/Claude/OpenCode resume from their own server-side state. Storing the full expanded prompts + replies on PaF's side is dead weight that bloats the session store without affecting resume behavior. For Ollama, history *is* the resume mechanism (replay), so it's kept intact.
+
+### Atomicity, corruption, concurrency
+
+- **Concurrent writes:** `sessions.db` uses SQLite immediate transactions with a 5s busy timeout. Reading, appending history, pruning and saving are one transaction, so parallel writers preserve updates.
+- **Migration:** the first access imports `sessions.json` once in the same transaction. Valid JSON remains untouched as a recovery copy. Later accesses use only SQLite, including after deleting all labels; old labels are never reimported. Older PaF versions still write JSON, so avoid mixing versions for session writes after migration.
+- **Recovery:** malformed legacy JSON is rotated to `sessions.json.corrupt-<timestamp>` with a stderr diagnostic. Read or rotation failures abort migration without overwriting the original. SQLite errors propagate; they never trigger an empty-store fallback.
+
+### Session management commands
+
+```bash
+phone-a-friend session list                    # show all persisted sessions
+phone-a-friend session list --json             # machine-readable
+phone-a-friend session delete <label>          # remove a single label
+phone-a-friend session prune --older-than 30   # drop sessions older than N days (default 30)
+phone-a-friend session prune --all             # drop everything
+```
+
+### Known limitations
+
+- **Codex resume + schema**: PaF forwards `--output-schema` on initial and resumed calls. Before a schema-bearing resume, it probes `codex exec resume --help` using the same invocation environment. Unsupported or failed probes stop before model execution with an actionable error; schema requests are never silently dropped. Plain resumes do not require this probe.
+- **Gemini sessions**: supported via `native-session` resume. PaF generates the session UUID client-side, pins it with `--session-id <uuid>` on the first call, and resumes with `--resume <uuid>` on later calls (same model as Claude). History is not replayed (server-side session state), so `run()` does not use `sessionHistory`. Resume depends on Gemini's session retention (`general.sessionRetention.*`); if retention has pruned the session, `--resume` fails loudly rather than silently starting fresh. A Gemini CLI too old to recognize `--session-id`/`--resume` surfaces an actionable upgrade error.
+- **Codex review + custom prompt**: `codex exec review` does not accept both `--base` and a positional prompt. When a custom prompt is provided with `--review`, the relay skips native `review()` and uses the generic `run()` path with the selected scope inlined.
+- **pi sessions**: PaF keeps pi sessions under `<PaF config dir>/pi-sessions`, outside pi's own store, so they do not appear in `pi --resume` (pass the same `--session-dir` to open one in pi). PaF never deletes files there: `session delete` and `session prune` remove the PaF label only, as for every backend. A start that fails after pi began the session (seen with a stopped model server, on 0.87.1 and 0.99.1) leaves an unreferenced file; PaF stores no label for it, picks a new ID next time, and so never resumes it. The pre-spawn check mirrors pi's header lookup including its Windows path rules, but nothing was run on Windows.
+- **Streaming + sessions**: `relayStream()` forwards session options to backends but does not implement session lifecycle (validation, history persistence). The CLI gates this combination off; only programmatic callers are affected.
+- **Review + sessions**: the CLI applies the same resume-strategy check as `prepareRelay` before `reviewRelay`. An unsupported backend errors and does not start. Supported backends resume through the generic review path, using the same metadata validation and persistence as relay.
+
+## Fast spawn
+
+The `--fast` flag maps to `--pure` for the OpenCode 1.x backend, skipping external plugins. OpenCode 2.x removed `--pure`, so on that line `--fast` and `backends.opencode.pure` have no effect (doctor says so). For pi it maps to `-nc -ns` (no AGENTS.md/CLAUDE.md context files, no skills); measured in this repository on a 9B local model, that cut the prompt from 22,004 to 1,527 input tokens, so it is the recommended setting for small local models unless the task depends on project conventions. It is a no-op for Antigravity, Claude, Codex, Gemini, Ollama, and Grok. Claude intentionally does not use `--bare` because bare mode skips OAuth/keychain reads and breaks subscription auth. For OpenCode 1.x, this is useful for self-contained tasks where external plugins are not needed.
+
+## Scope
+
+This repository contains relay functionality, backend detection, configuration system, Claude/OpenCode/Codex/pi/Grok host integration installers, interactive TUI dashboard, agentic multi-agent orchestration, background job tracking, structured output, session continuity, and fast spawn. Policy engines, hooks, approvals, and trusted scripts are intentionally out of scope.

@@ -1,0 +1,353 @@
+/**
+ * Backend interface and registry for relay targets.
+ *
+ * Ported from phone_a_friend/backends/__init__.py
+ */
+
+import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
+
+export const REVIEW_SCOPES = ['branch', 'working-tree', 'all'] as const;
+export type ReviewScope = typeof REVIEW_SCOPES[number];
+
+export function isReviewScope(value: unknown): value is ReviewScope {
+  return typeof value === 'string' && REVIEW_SCOPES.includes(value as ReviewScope);
+}
+
+/** How a Claude relay participates in Claude Code cross-session messaging. */
+export type ClaudePeerMessagingMode = 'native' | 'accept' | 'refuse';
+
+export const CLAUDE_PEER_MESSAGING_MODES: readonly ClaudePeerMessagingMode[] = [
+  'native',
+  'accept',
+  'refuse',
+];
+
+export type ResumeStrategy = 'native-session' | 'transcript-replay' | 'unsupported';
+
+export interface BackendCapabilities {
+  /** How this backend handles session resumption. */
+  resumeStrategy: ResumeStrategy;
+  /** Whether the caller must generate a session ID before the first call (e.g. Claude's --session-id). */
+  requiresClientSessionId: boolean;
+}
+
+export interface BackendResult {
+  output: string;
+  exitCode: number;
+}
+
+export interface SessionHistoryEntry {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+/**
+ * Progress reported by a backend while a run is in flight. Only evidence the
+ * backend itself emits is surfaced; PaF never synthesizes activity.
+ */
+export interface BackendEvent {
+  type:
+    | 'session_linked'
+    | 'turn_started'
+    | 'activity'
+    | 'message'
+    | 'turn_completed'
+    | 'turn_failed'
+    | 'error';
+  message: string;
+  data?: Record<string, unknown>;
+}
+
+export interface BackendRunOptions {
+  prompt: string;
+  repoPath: string;
+  timeoutSeconds: number;
+  sandbox: SandboxMode;
+  model: string | null;
+  env: Record<string, string>;
+  schema?: string | null;
+  sessionId?: string | null;
+  persistSession?: boolean;
+  resumeSession?: boolean;
+  fast?: boolean;
+  /** Claude-only cross-session messaging policy. Ignored by other backends. */
+  peerMessaging?: ClaudePeerMessagingMode;
+  /** Human-readable PaF label used to name a peer-visible backend session. */
+  sessionLabel?: string | null;
+  sessionHistory?: SessionHistoryEntry[];
+  onSessionCreated?: (sessionId: string) => void;
+  /** Receives backend progress events as they arrive. Optional; absent means no progress stream is requested. */
+  onEvent?: (event: BackendEvent) => void;
+}
+
+export interface ReviewOptions {
+  repoPath: string;
+  timeoutSeconds: number;
+  sandbox: SandboxMode;
+  model: string | null;
+  env: Record<string, string>;
+  base: string;
+  scope?: ReviewScope;
+  prompt?: string;
+  /** Receives backend progress events as they arrive. Optional. */
+  onEvent?: (event: BackendEvent) => void;
+}
+
+/** Where a relay prompt is headed, for backends that adjust it. */
+export interface PreparePromptContext {
+  mode: 'relay' | 'review';
+}
+
+export interface Backend {
+  name: string;
+  localFileAccess: boolean;
+  allowedSandboxes: ReadonlySet<SandboxMode>;
+  capabilities: BackendCapabilities;
+  /** Review scopes handled by the backend's native review() implementation. Defaults to branch only. */
+  nativeReviewScopes?: ReadonlySet<ReviewScope>;
+  /**
+   * Optional last-step rewrite of the fully built relay prompt, applied by
+   * the relay core on every path (relay, session, stream, generic review)
+   * before the size limit. Backends without it receive the prompt untouched.
+   */
+  preparePrompt?(prompt: string, ctx: PreparePromptContext): string;
+  run(opts: BackendRunOptions): Promise<string>;
+  review?(opts: ReviewOptions): Promise<string>;
+  runStream?(opts: BackendRunOptions): AsyncIterable<string>;
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+export class BackendError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BackendError';
+  }
+}
+
+export class SpawnCliError extends BackendError {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number | null;
+
+  constructor(
+    message: string,
+    stdout: string,
+    stderr: string,
+    exitCode: number | null,
+  ) {
+    super(message);
+    this.name = 'SpawnCliError';
+    this.stdout = stdout;
+    this.stderr = stderr;
+    this.exitCode = exitCode;
+  }
+}
+
+export class SpawnCliTimeoutError extends BackendError {
+  readonly timeoutMs: number;
+
+  constructor(message: string, timeoutMs: number) {
+    super(message);
+    this.name = 'SpawnCliTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Install hints
+// ---------------------------------------------------------------------------
+
+export const INSTALL_HINTS: Record<string, string> = {
+  antigravity: 'curl -fsSL https://antigravity.google/cli/install.sh | bash',
+  codex: 'npm install -g @openai/codex',
+  gemini: 'npm install -g @google/gemini-cli',
+  ollama: 'https://ollama.com/download',
+  claude: 'npm install -g @anthropic-ai/claude-code',
+  opencode: 'npm install -g opencode-ai',
+  pi: 'npm install -g @earendil-works/pi-coding-agent',
+  grok: 'npm install -g @xai-official/grok',
+};
+
+export const BACKEND_COMMANDS: Record<string, string> = {
+  antigravity: 'agy',
+  claude: 'claude',
+  codex: 'codex',
+  gemini: 'gemini',
+  ollama: 'ollama',
+  opencode: 'opencode',
+  pi: 'pi',
+  grok: 'grok',
+};
+
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+
+const registry = new Map<string, Backend>();
+
+export function registerBackend(backend: Backend): void {
+  registry.set(backend.name, backend);
+}
+
+export function getBackend(name: string): Backend {
+  const backend = registry.get(name);
+  if (!backend) {
+    const supported = [...registry.keys()].sort().join(', ');
+    throw new BackendError(
+      `Unsupported relay backend: ${name}. Supported: ${supported}`,
+    );
+  }
+  return backend;
+}
+
+/** Clear registry — only for testing. */
+export function _resetRegistry(): void {
+  registry.clear();
+}
+
+// ---------------------------------------------------------------------------
+// PATH detection
+// ---------------------------------------------------------------------------
+
+export function isInPath(name: string, env?: Record<string, string>): boolean {
+  try {
+    execFileSync('which', [name], { stdio: 'pipe', ...(env ? { env } : {}) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function checkBackends(
+  whichFn: (name: string) => boolean = isInPath,
+): Record<string, boolean> {
+  const result: Record<string, boolean> = {};
+  for (const name of Object.keys(INSTALL_HINTS).sort()) {
+    result[name] = whichFn(BACKEND_COMMANDS[name] ?? name);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Async subprocess runner
+// ---------------------------------------------------------------------------
+
+export interface SpawnCliOptions {
+  timeoutMs: number;
+  /** Full process environment. Defaults to process.env if not provided.
+   *  When provided, this replaces the entire env (Node.js spawn behavior).
+   *  Callers must pass a complete env (e.g. from nextRelayEnv()), not partial overrides. */
+  env?: Record<string, string>;
+  cwd?: string;
+  /** Label used in error messages (e.g. "codex exec", "gemini"). Defaults to the command name. */
+  label?: string;
+  /** Receives stdout chunks as they arrive, for progress observers. Errors thrown here are ignored. */
+  onStdout?: (chunk: string) => void;
+  /**
+   * Opt-in: after the timeout or SIGINT sends SIGTERM, send SIGKILL if the
+   * child has not closed within this many milliseconds. Without it the wait
+   * for a child that ignores SIGTERM has no bound (the long-standing default,
+   * kept for backends that have not opted in).
+   */
+  killGraceMs?: number;
+}
+
+export interface SpawnCliResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+/**
+ * Async subprocess runner shared by all CLI backends.
+ * Replaces execFileSync: non-blocking, timeout handling, signal forwarding, stderr draining.
+ */
+export function spawnCli(
+  command: string,
+  args: string[],
+  opts: SpawnCliOptions,
+): Promise<SpawnCliResult> {
+  const label = opts.label ?? command;
+
+  return new Promise((resolve, reject) => {
+    const child = nodeSpawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: opts.env ?? process.env as Record<string, string>,
+      cwd: opts.cwd,
+    });
+
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
+    const terminate = (): void => {
+      child.kill('SIGTERM');
+      if (opts.killGraceMs !== undefined && !killTimer) {
+        killTimer = setTimeout(() => { child.kill('SIGKILL'); }, opts.killGraceMs);
+      }
+    };
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      terminate();
+    }, opts.timeoutMs);
+
+    const onSigint = () => { terminate(); };
+    process.on('SIGINT', onSigint);
+
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutChunks.push(chunk);
+      if (opts.onStdout) {
+        try {
+          opts.onStdout(chunk.toString());
+        } catch {
+          // Observers must never break the subprocess run.
+        }
+      }
+    });
+    child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      process.removeListener('SIGINT', onSigint);
+      reject(new BackendError(`${label} failed to start: ${err.message}`));
+    });
+
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      process.removeListener('SIGINT', onSigint);
+
+      const stdout = Buffer.concat(stdoutChunks).toString().trim();
+      const stderr = Buffer.concat(stderrChunks).toString().trim();
+
+      if (timedOut) {
+        reject(new SpawnCliTimeoutError(`${label} timed out after ${opts.timeoutMs / 1000}s`, opts.timeoutMs));
+        return;
+      }
+
+      if (signal) {
+        reject(new BackendError(`${label} killed by signal ${signal}`));
+        return;
+      }
+
+      if (code !== 0 && code !== null) {
+        const detail = stderr || stdout || `${label} exited with code ${code}`;
+        reject(new SpawnCliError(detail, stdout, stderr, code));
+        return;
+      }
+
+      resolve({ stdout, stderr, exitCode: code ?? 0 });
+    });
+  });
+}

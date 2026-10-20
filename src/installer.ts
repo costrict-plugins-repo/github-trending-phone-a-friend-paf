@@ -1,0 +1,1787 @@
+/**
+ * Install logic for Claude plugin integration.
+ *
+ * Ported from phone_a_friend/installer.py
+ */
+
+import { execFileSync } from 'node:child_process';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  cpSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { resolve, join, dirname, basename, isAbsolute, sep } from 'node:path';
+import { homedir } from 'node:os';
+import { checkBackends, INSTALL_HINTS } from './backends/index.js';
+import { resolvePiStoredPath } from './backends/pi.js';
+import { pafConfigDir } from './config.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+export const PLUGIN_NAME = 'phone-a-friend';
+export const MARKETPLACE_NAME = 'phone-a-friend-marketplace';
+// The optional review panel (mods/paf-tasks), a second plugin in the same marketplace.
+export const MOD_PLUGIN_NAME = 'paf-tasks';
+
+/** Previous marketplace name; cleaned up during install/uninstall for existing users. */
+const LEGACY_MARKETPLACE_NAME = 'phone-a-friend-dev';
+
+/** GitHub repository for marketplace distribution. */
+export const GITHUB_REPO = 'freibergergarcia/phone-a-friend';
+
+const INSTALL_TARGETS = new Set(['claude', 'opencode', 'codex', 'pi', 'grok', 'all']);
+const INSTALL_MODES = new Set(['symlink', 'copy']);
+const OPENCODE_SKILLS = ['phone-a-friend', 'curiosity-engine'] as const;
+
+/**
+ * Skills installed for Codex. Codex auto-discovers skills at
+ * `$CODEX_HOME/skills/<name>/SKILL.md` (defaulting to `~/.codex/skills/`),
+ * so the source folder is dropped in directly. No separate command-shim
+ * file is needed because Codex treats skills as first-class slash
+ * invocations.
+ *
+ * `phone-a-team` is shipped via the `.codex/` overlay
+ * (`skills/phone-a-team/.codex/SKILL.md`). On Codex, /phone-a-team
+ * runs parallel phone-a-friend CLI relays through Bash and synthesizes
+ * their results in the host model between rounds.
+ */
+const CODEX_SKILLS = ['phone-a-friend', 'curiosity-engine', 'phone-a-team'] as const;
+
+/**
+ * Skills installed for pi. pi discovers a user skill at
+ * `<agent-dir>/skills/<name>/SKILL.md` and exposes it as `/skill:<name>`,
+ * so there is no command shim to install (pi docs: skills.md,
+ * configuration.md). The host-neutral `skills/<name>/` folder is used as is.
+ * `phone-a-team` is left out: pi has no team mechanics.
+ *
+ * The same two skills are pinned by the `pi` manifest in package.json, which
+ * is what `pi install npm:@freibergergarcia/phone-a-friend` loads.
+ */
+const PI_SKILLS = ['phone-a-friend', 'curiosity-engine'] as const;
+
+/**
+ * Skills installed for Grok Build. Grok discovers a user skill at
+ * `~/.grok/skills/<name>/SKILL.md`. The host-neutral folder is used as is.
+ * `phone-a-team` ships from `skills/phone-a-team/.grok/SKILL.md`: a Bash
+ * round loop, the same shape as Codex, because Grok has no Agent Teams
+ * mechanic to spawn.
+ */
+const GROK_SKILLS = ['phone-a-friend', 'curiosity-engine', 'phone-a-team'] as const;
+
+const PAF_NPM_NAME = '@freibergergarcia/phone-a-friend';
+
+/**
+ * Written into a copied pi skill so uninstall can tell PaF's copy from a
+ * skill the user wrote under the same name. Symlinks need no marker: their
+ * target says who owns them.
+ */
+const PI_INSTALL_MARKER = '.phone-a-friend-install';
+
+/**
+ * Codex no longer ships subagent personas. The earlier paf-reviewer /
+ * paf-critic / paf-synthesizer design was dropped because Codex subagents
+ * only spawn on explicit natural-language request (per the official
+ * subagents docs), which made them a poor fit for the everyday relay
+ * surface. /phone-a-team for Codex is now a pure Bash-orchestrated skill
+ * that loops rounds itself and lets Codex's own model synthesize between
+ * rounds. Skills install path remains unchanged; the agents/ install
+ * path was removed.
+ *
+ * The orphaned `agents/codex/paf-*.toml` files in the repo are kept until
+ * the user authorizes deletion per the global "never delete without
+ * permission" rule.
+ */
+
+/**
+ * Codex marketplace registration uses Codex's own plugin CLI surface
+ * (`codex plugin marketplace add` + `codex plugin add`). Verified against
+ * codex-cli 0.133.0: subcommands are `add`/`list`/`remove` (no separate
+ * install/enable/disable verbs). Marketplace name matches the `name`
+ * field in `.agents/plugins/marketplace.json`.
+ */
+const CODEX_MARKETPLACE_NAME = 'phone-a-friend-marketplace';
+
+/**
+ * Skills/commands that PaF previously installed for OpenCode but no longer
+ * supports there. The installer removes any installed artifacts for these
+ * names so existing users get a clean uninstall on their next
+ * `plugin update --opencode`.
+ *
+ * `phone-a-team` was dropped because it relies on Claude Agent Teams
+ * primitives (TeamCreate, Task, SendMessage, TeamDelete) that have no
+ * OpenCode equivalent. The portable shell-based version we shipped for
+ * OpenCode could not orchestrate reliably with smaller models. Claude
+ * keeps the rich `commands/phone-a-team.md` runbook.
+ */
+const OPENCODE_LEGACY_SKILLS = ['phone-a-team'] as const;
+
+/**
+ * Same rationale as OPENCODE_LEGACY_SKILLS but for Codex. PaF never shipped
+ * a Codex `phone-a-team` skill, but the legacy slot exists symmetrically
+ * so future deprecations have an obvious home.
+ */
+const CODEX_LEGACY_SKILLS = [] as const;
+
+type InstallTarget = 'claude' | 'opencode' | 'codex' | 'pi' | 'grok' | 'all';
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+export class InstallerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InstallerError';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+function ensureParent(filePath: string): void {
+  mkdirSync(dirname(filePath), { recursive: true });
+}
+
+function removePath(filePath: string): void {
+  let stat;
+  try {
+    stat = lstatSync(filePath);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw err;
+  }
+  if (stat.isSymbolicLink() || stat.isFile()) {
+    unlinkSync(filePath);
+  } else if (stat.isDirectory()) {
+    rmSync(filePath, { recursive: true, force: true });
+  }
+}
+
+function installPath(src: string, dst: string, mode: string, force: boolean): string {
+  const dstExists = existsSync(dst) || isSymlink(dst);
+
+  if (dstExists) {
+    if (isSymlink(dst)) {
+      // realpathSync throws on dangling symlinks — handle gracefully
+      try {
+        if (realpathSync(dst) === realpathSync(src)) {
+          return 'already-installed';
+        }
+      } catch {
+        // Dangling symlink — fall through to force/error handling
+      }
+    }
+    if (!force) {
+      throw new InstallerError(`Destination already exists: ${dst}`);
+    }
+    removePath(dst);
+  }
+
+  ensureParent(dst);
+  if (mode === 'symlink') {
+    symlinkSync(src, dst);
+  } else {
+    cpSync(src, dst, { recursive: true });
+  }
+  return 'installed';
+}
+
+function isSymlink(filePath: string): boolean {
+  try {
+    return lstatSync(filePath).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function runClaudeCommand(args: string[], cwd?: string): { code: number; output: string } {
+  try {
+    const result = execFileSync(args[0], args.slice(1), {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      ...(cwd ? { cwd } : {}),
+    });
+    return { code: 0, output: result.trim() };
+  } catch (err: unknown) {
+    const execErr = err as NodeJS.ErrnoException & {
+      status?: number;
+      stdout?: Buffer | string;
+      stderr?: Buffer | string;
+    };
+    const stdout = execErr.stdout?.toString() ?? '';
+    const stderr = execErr.stderr?.toString() ?? '';
+    return {
+      code: execErr.status ?? 1,
+      output: (stdout + stderr).trim(),
+    };
+  }
+}
+
+function looksLikeOkIfAlready(output: string): boolean {
+  const text = output.toLowerCase();
+  return [
+    'already configured',
+    'already added',
+    'already installed',
+    'already enabled',
+    'already up to date',
+    'already at the latest version',
+  ].some(token => text.includes(token));
+}
+
+function cleanupLegacyMarketplace(): string[] {
+  const lines: string[] = [];
+
+  try {
+    execFileSync('which', ['claude'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch {
+    return lines;
+  }
+
+  // Remove old plugin registration under the legacy marketplace name
+  const commands: [string[], string][] = [
+    [['claude', 'plugin', 'disable', `${PLUGIN_NAME}@${LEGACY_MARKETPLACE_NAME}`, '-s', 'user'], 'legacy_disable'],
+    [['claude', 'plugin', 'uninstall', `${PLUGIN_NAME}@${LEGACY_MARKETPLACE_NAME}`, '-s', 'user'], 'legacy_uninstall'],
+    [['claude', 'plugin', 'marketplace', 'remove', LEGACY_MARKETPLACE_NAME], 'legacy_marketplace_remove'],
+  ];
+
+  for (const [cmd, label] of commands) {
+    const { code } = runClaudeCommand(cmd);
+    if (code === 0) {
+      lines.push(`- claude_cli_${label}: ok`);
+    }
+    // Silently ignore failures (legacy may not exist)
+  }
+
+  return lines;
+}
+
+function syncClaudePluginRegistration(
+  source: string,
+  marketplaceName: string = MARKETPLACE_NAME,
+  pluginName: string = PLUGIN_NAME,
+  scope: string = 'user',
+): string[] {
+  const lines: string[] = [];
+
+  // Check if claude binary is available
+  try {
+    execFileSync('which', ['claude'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch {
+    lines.push('- claude_cli: skipped (claude binary not found)');
+    return lines;
+  }
+
+  const commands: [string[], string][] = [
+    [['claude', 'plugin', 'marketplace', 'add', source], 'marketplace_add'],
+    [['claude', 'plugin', 'marketplace', 'update', marketplaceName], 'marketplace_update'],
+    [['claude', 'plugin', 'install', `${pluginName}@${marketplaceName}`, '-s', scope], 'install'],
+    [['claude', 'plugin', 'enable', `${pluginName}@${marketplaceName}`, '-s', scope], 'enable'],
+    [['claude', 'plugin', 'update', `${pluginName}@${marketplaceName}`], 'update'],
+  ];
+
+  for (const [cmd, label] of commands) {
+    const { code, output } = runClaudeCommand(cmd);
+    if (code === 0 || looksLikeOkIfAlready(output)) {
+      lines.push(`- claude_cli_${label}: ok`);
+    } else {
+      lines.push(`- claude_cli_${label}: failed`);
+      if (output) {
+        lines.push(`  output: ${output}`);
+      }
+    }
+  }
+
+  return lines;
+}
+
+function unsyncClaudePluginRegistration(
+  marketplaceName: string = MARKETPLACE_NAME,
+  pluginName: string = PLUGIN_NAME,
+  _claudeHome?: string,
+): string[] {
+  // Note: _claudeHome is accepted for signature consistency with the guard
+  // in uninstallHosts, but the `claude` CLI always uses its own default home.
+  // A future version could use it for getMarketplaceSourceType checks here.
+  const lines: string[] = [];
+
+  try {
+    execFileSync('which', ['claude'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch {
+    lines.push('- claude_cli: skipped (claude binary not found)');
+    return lines;
+  }
+
+  // Unregister from current marketplace name
+  const commands: [string[], string][] = [
+    [['claude', 'plugin', 'disable', `${pluginName}@${marketplaceName}`, '-s', 'user'], 'disable'],
+    [['claude', 'plugin', 'uninstall', `${pluginName}@${marketplaceName}`, '-s', 'user'], 'uninstall'],
+    [['claude', 'plugin', 'uninstall', `${MOD_PLUGIN_NAME}@${marketplaceName}`, '-s', 'user'], 'mod_uninstall'],
+    [['claude', 'plugin', 'marketplace', 'remove', marketplaceName], 'marketplace_remove'],
+  ];
+
+  for (const [cmd, label] of commands) {
+    const { code, output } = runClaudeCommand(cmd);
+    // The review panel comes from the same marketplace, so it goes with it
+    // rather than stay installed without one. Most users never installed it:
+    // a failure here is not reported.
+    if (label === 'mod_uninstall') {
+      if (code === 0) lines.push(`- claude_cli_${label}: ok`);
+      continue;
+    }
+    if (code === 0 || looksLikeOkIfAlready(output)) {
+      lines.push(`- claude_cli_${label}: ok`);
+    } else {
+      lines.push(`- claude_cli_${label}: failed`);
+      if (output) {
+        lines.push(`  output: ${output}`);
+      }
+    }
+  }
+
+  // Also clean up legacy marketplace name if it exists
+  if (marketplaceName !== LEGACY_MARKETPLACE_NAME) {
+    const legacyCommands: [string[], string][] = [
+      [['claude', 'plugin', 'disable', `${pluginName}@${LEGACY_MARKETPLACE_NAME}`, '-s', 'user'], 'legacy_disable'],
+      [['claude', 'plugin', 'uninstall', `${pluginName}@${LEGACY_MARKETPLACE_NAME}`, '-s', 'user'], 'legacy_uninstall'],
+      [['claude', 'plugin', 'marketplace', 'remove', LEGACY_MARKETPLACE_NAME], 'legacy_marketplace_remove'],
+    ];
+    for (const [cmd, label] of legacyCommands) {
+      const { code, output } = runClaudeCommand(cmd);
+      if (code === 0) {
+        lines.push(`- claude_cli_${label}: ok`);
+      }
+      // Silently ignore failures for legacy cleanup
+    }
+  }
+
+  return lines;
+}
+
+/**
+ * Claude Code's configuration directory: `CLAUDE_CONFIG_DIR` when set, else
+ * `~/.claude`. The `claude` CLI that PaF shells out to inherits the same
+ * variable, so PaF must read the registry it writes from the same place.
+ */
+export function claudeConfigRoot(claudeHome?: string): string {
+  return claudeHome || process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+}
+
+export function claudeTarget(claudeHome?: string): string {
+  return join(claudeConfigRoot(claudeHome), 'plugins', PLUGIN_NAME);
+}
+
+export function opencodeConfigRoot(opencodeHome?: string): string {
+  if (opencodeHome) return opencodeHome;
+  const xdgConfig = process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config');
+  return join(xdgConfig, 'opencode');
+}
+
+export function opencodeSkillTarget(name: string, opencodeHome?: string): string {
+  return join(opencodeConfigRoot(opencodeHome), 'skills', name);
+}
+
+export function opencodeCommandTarget(name: string, opencodeHome?: string): string {
+  return join(opencodeConfigRoot(opencodeHome), 'commands', `${name}.md`);
+}
+
+/**
+ * Resolve the OpenCode command source path for a skill.
+ *
+ * Per-skill overlay at `skills/<name>/COMMAND.opencode.md` wins when present,
+ * otherwise falls back to the shared `commands/<name>.md`. The overlay lets a
+ * skill ship a different command shim for OpenCode than the one Claude loads.
+ */
+export function opencodeCommandSource(repoRoot: string, name: string): string {
+  const overlay = join(repoRoot, 'skills', name, 'COMMAND.opencode.md');
+  if (existsSync(overlay)) return overlay;
+  return join(repoRoot, 'commands', `${name}.md`);
+}
+
+/**
+ * Resolve the Codex config root. Honors `$CODEX_HOME` first (Codex's own
+ * convention), then falls back to `~/.codex`.
+ */
+export function codexConfigRoot(codexHome?: string): string {
+  if (codexHome) return codexHome;
+  if (process.env.CODEX_HOME) return process.env.CODEX_HOME;
+  return join(homedir(), '.codex');
+}
+
+export function codexSkillTarget(name: string, codexHome?: string): string {
+  return join(codexConfigRoot(codexHome), 'skills', name);
+}
+
+
+/**
+ * Resolve the Codex skill source folder.
+ *
+ * Per-skill overlay at `skills/<name>/.codex/` wins when present, otherwise
+ * we install `skills/<name>/` directly. The overlay lets a skill ship a
+ * Codex-tuned variant (different host marker, different defaults) without
+ * polluting the host-neutral folder Claude consumes.
+ *
+ * The overlay convention places the variant in a dotfile subdirectory so it
+ * doesn't get picked up by other hosts that scan `skills/<name>/`.
+ */
+export function codexSkillSource(repoRoot: string, name: string): string {
+  const overlay = join(repoRoot, 'skills', name, '.codex');
+  if (existsSync(join(overlay, 'SKILL.md'))) return overlay;
+  return join(repoRoot, 'skills', name);
+}
+
+/**
+ * pi's agent directory: `PI_CODING_AGENT_DIR` normalized the way pi's own
+ * `getAgentDir()` does, otherwise `~/.pi/agent`.
+ */
+export function piAgentDir(piHome?: string, platform: NodeJS.Platform = process.platform): string {
+  if (piHome) return piHome;
+  const fromEnv = process.env.PI_CODING_AGENT_DIR;
+  // Same rules as pi's `normalizePath`: `~`, `file://` URLs and, on Windows,
+  // `~\` and shell drive paths. A path pi reads differently would put the
+  // skills where pi never looks.
+  if (fromEnv) return resolvePiStoredPath(fromEnv, process.cwd(), platform);
+  return join(homedir(), '.pi', 'agent');
+}
+
+export function piSkillTarget(name: string, piHome?: string): string {
+  return join(piAgentDir(piHome), 'skills', name);
+}
+
+/** Grok's config root. Skills live in `<root>/skills/<name>`. Defaults to `~/.grok`. */
+export function grokConfigRoot(grokHome?: string): string {
+  if (grokHome) return grokHome;
+  return join(homedir(), '.grok');
+}
+
+export function grokSkillTarget(name: string, grokHome?: string): string {
+  return join(grokConfigRoot(grokHome), 'skills', name);
+}
+
+/**
+ * Grok skill source. `skills/<name>/.grok/SKILL.md` wins when a skill needs
+ * host-specific text (phone-a-team). Otherwise the host-neutral folder is
+ * installed as is.
+ */
+export function grokSkillSource(repoRoot: string, name: string): string {
+  const overlay = join(repoRoot, 'skills', name, '.grok');
+  if (existsSync(join(overlay, 'SKILL.md'))) return overlay;
+  return join(repoRoot, 'skills', name);
+}
+
+/**
+ * True when `target` is a symlink pointing somewhere inside this PaF repo.
+ * Used to auto-replace stale PaF-owned symlinks when source paths change
+ * (e.g. moving the OpenCode command shim from commands/ to skills/<name>/).
+ */
+function isStalePafSymlink(target: string, repoRoot: string): boolean {
+  if (!isSymlink(target)) return false;
+  let realRepo: string;
+  try {
+    realRepo = realpathSync(repoRoot);
+  } catch {
+    return false;
+  }
+  // Valid symlink: resolve and compare.
+  try {
+    const realTarget = realpathSync(target);
+    return realTarget === realRepo || realTarget.startsWith(realRepo + sep);
+  } catch {
+    // Symlink target may be deleted (e.g. after option C removed the
+    // phone-a-team source files). Fall back to reading the literal symlink
+    // path and walk up until we find an existing parent we can realpath.
+    // This handles macOS path aliases like /var → /private/var that would
+    // otherwise foil a string-prefix comparison.
+    try {
+      const link = readlinkSync(target);
+      const absLink = isAbsolute(link) ? link : resolve(dirname(target), link);
+      let probe = absLink;
+      while (probe !== dirname(probe)) {
+        if (existsSync(probe)) {
+          const realProbe = realpathSync(probe);
+          return realProbe === realRepo || realProbe.startsWith(realRepo + sep);
+        }
+        probe = dirname(probe);
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+}
+
+export function isPluginInstalled(claudeHome?: string): boolean {
+  const target = claudeTarget(claudeHome);
+  // Check local symlink/copy install
+  try {
+    const resolved = realpathSync(target);
+    if (existsSync(resolved)) return true;
+  } catch {
+    // Dangling symlink or missing path, fall through
+  }
+  if (existsSync(target)) return true;
+
+  // Heuristic: check marketplace cache install.
+  // This is best-effort. Cache presence after marketplace uninstall could
+  // theoretically be a false positive, but in practice Claude Code removes
+  // the cache directory on uninstall. The authoritative check would be
+  // parsing `claude plugin list`, but that's too slow for a TUI status bar.
+  const home = claudeConfigRoot(claudeHome);
+  const cacheBase = join(home, 'plugins', 'cache', MARKETPLACE_NAME, PLUGIN_NAME);
+  try {
+    return existsSync(cacheBase);
+  } catch {
+    return false;
+  }
+}
+
+export function isOpenCodeInstalled(opencodeHome?: string): boolean {
+  return OPENCODE_SKILLS.every((name) => (
+    existsSync(join(opencodeSkillTarget(name, opencodeHome), 'SKILL.md')) &&
+    existsSync(opencodeCommandTarget(name, opencodeHome))
+  ));
+}
+
+/**
+ * True when the Codex integration is usable, via either install path.
+ *
+ * Path 1 — loose-file install (`phone-a-friend plugin install --codex`):
+ *   $CODEX_HOME/skills/<name>/SKILL.md
+ *
+ * Path 2 — marketplace install (`codex plugin marketplace add` + `codex plugin add`):
+ *   $CODEX_HOME/plugins/cache/phone-a-friend-marketplace/phone-a-friend/<version>/skills/<name>/SKILL.md
+ *
+ * Either path counts. Without this, doctor + TUI would report "not installed"
+ * for marketplace-only installs even though Codex itself shows the plugin
+ * enabled in `codex plugin list` and the skills are callable inside Codex.
+ */
+export function isCodexInstalled(codexHome?: string): boolean {
+  const looseFileOk = CODEX_SKILLS.every((name) =>
+    existsSync(join(codexSkillTarget(name, codexHome), 'SKILL.md')),
+  );
+  if (looseFileOk) return true;
+
+  const cacheRoot = join(
+    codexConfigRoot(codexHome),
+    'plugins',
+    'cache',
+    MARKETPLACE_NAME,
+    PLUGIN_NAME,
+  );
+  if (!existsSync(cacheRoot)) return false;
+  try {
+    const versions = readdirSync(cacheRoot);
+    return versions.some((ver) =>
+      CODEX_SKILLS.every((name) =>
+        existsSync(join(cacheRoot, ver, 'skills', name, 'SKILL.md')),
+      ),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** True when the directory's package.json names PaF's npm package. */
+function isPafPackageDir(dir: string): boolean {
+  try {
+    const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf-8'));
+    return (manifest as { name?: unknown } | null)?.name === PAF_NPM_NAME;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when `source` is PaF as an npm or a local pi package, dispatched in
+ * the order pi's `parseSource` uses: an untrimmed `npm:` prefix first (name
+ * split by pi's spec pattern), then git, otherwise a local path, trimmed
+ * and resolved from the directory of the settings file.
+ *
+ * Git sources never count. pi resolves them with hosted-git-info, and an
+ * imitation of that parser here was wrong in a new way on every review
+ * pass. The status therefore does not see a PaF package installed from git;
+ * that is documented, and errs towards "not installed".
+ */
+function isPafPiPackageSource(source: string, agentDir: string): boolean {
+  if (source.startsWith('npm:')) {
+    const spec = source.slice('npm:'.length).trim();
+    const match = /^(@?[^@]+(?:\/[^@]+)?)(?:@(.+))?$/.exec(spec);
+    return (match?.[1] ?? spec) === PAF_NPM_NAME;
+  }
+  const trimmed = source.trim();
+  if (trimmed.startsWith('git:') || /^(?:https?|ssh|git):\/\//i.test(trimmed)) return false;
+  try {
+    return isPafPackageDir(resolvePiStoredPath(trimmed, agentDir));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when pi's user settings declare PaF as a pi package that loads its
+ * skills unfiltered. `packages` entries are a source string or an object
+ * with a `source` and optional filters. PaF does not evaluate pi's filter
+ * language: an entry with a `skills` filter or `autoload: false` does not
+ * count, so the status errs towards "not installed" rather than claiming
+ * skills pi may not load.
+ */
+function isPiPackageDeclared(piHome?: string): boolean {
+  const agentDir = piAgentDir(piHome);
+  let settings: unknown;
+  try {
+    settings = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf-8'));
+  } catch {
+    return false;
+  }
+  const packages = (settings as { packages?: unknown } | null)?.packages;
+  if (!Array.isArray(packages)) return false;
+  return packages.some((entry: unknown) => {
+    if (typeof entry === 'string') return isPafPiPackageSource(entry, agentDir);
+    if (typeof entry !== 'object' || entry === null) return false;
+    const { source, skills, autoload } = entry as { source?: unknown; skills?: unknown; autoload?: unknown };
+    if (typeof source !== 'string' || skills !== undefined || autoload === false) return false;
+    return isPafPiPackageSource(source, agentDir);
+  });
+}
+
+/**
+ * True when the pi integration is usable, via either install path: the
+ * loose skills from `phone-a-friend plugin install --pi`, or PaF declared as
+ * a pi package (`pi install npm:@freibergergarcia/phone-a-friend`).
+ */
+export function isPiInstalled(piHome?: string): boolean {
+  const looseFileOk = PI_SKILLS.every((name) =>
+    existsSync(join(piSkillTarget(name, piHome), 'SKILL.md')),
+  );
+  return looseFileOk || isPiPackageDeclared(piHome);
+}
+
+/**
+ * True only when both Grok skills were put there by PaF. A skill Grok can
+ * see because a Claude plugin is installed does not count, and a directory
+ * the user wrote under the same name does not count either.
+ */
+export function isGrokInstalled(grokHome?: string): boolean {
+  return GROK_SKILLS.every((name) => {
+    const target = grokSkillTarget(name, grokHome);
+    if (!existsSync(target) && !isSymlink(target)) return false;
+    return isPafOwnedPiSkill(target, name);
+  });
+}
+
+function runCodexCommand(args: string[]): { code: number; output: string } {
+  try {
+    const result = execFileSync(args[0], args.slice(1), {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return { code: 0, output: result.trim() };
+  } catch (err: unknown) {
+    const execErr = err as NodeJS.ErrnoException & {
+      status?: number;
+      stdout?: Buffer | string;
+      stderr?: Buffer | string;
+    };
+    const stdout = execErr.stdout?.toString() ?? '';
+    const stderr = execErr.stderr?.toString() ?? '';
+    return {
+      code: execErr.status ?? 1,
+      output: (stdout + stderr).trim(),
+    };
+  }
+}
+
+function looksLikeCodexAlready(output: string): boolean {
+  const text = output.toLowerCase();
+  return [
+    'already added',
+    'already installed',
+    'already enabled',
+    'already registered',
+  ].some((token) => text.includes(token));
+}
+
+/**
+ * Register PaF as a Codex plugin via the `codex` CLI.
+ *
+ * The marketplace+plugin manifests at `.agents/plugins/marketplace.json` and
+ * `plugins/phone-a-friend/.codex-plugin/plugin.json` make PaF visible in
+ * `codex plugin list` and Codex's `/plugins` surface. Codex's marketplace
+ * cache only mirrors the per-plugin `.codex-plugin/plugin.json` itself, not
+ * skills/agents content (Codex does not follow symlinks or up-paths during
+ * cache population). The actual skill + agent files still ship via the
+ * loose-file install (`$CODEX_HOME/skills/` + `$CODEX_HOME/agents/`); this
+ * sync is for discoverability + the eventual upstream cache improvement.
+ */
+/**
+ * Choose the source argument for `codex plugin marketplace add`.
+ *
+ * Codex parses the marketplace source as `owner/repo[@ref]` (a local path, an
+ * `owner/repo[@ref]` slug, or a Git URL). A local filesystem path that
+ * contains `@` — notably an npm-scoped global install at
+ * `.../@freibergergarcia/phone-a-friend` — is misread: the `@` is taken as a
+ * git ref delimiter and Codex rejects it with
+ * `--ref is only supported for git marketplace sources`. Claude's marketplace
+ * grammar has no `@ref` form, so only Codex is affected (verified: Claude
+ * registers the same scoped path as a `directory` source without error).
+ *
+ * For `@`-containing paths we fall back to the GitHub slug, which Codex
+ * resolves as a Git marketplace source (verified working against
+ * github.com/freibergergarcia/phone-a-friend). Clean local paths — the common
+ * local-dev `mode: symlink` case — are passed through unchanged so developers
+ * register their working tree rather than GitHub main.
+ */
+export function codexMarketplaceSource(resolvedRepo: string): string {
+  return resolvedRepo.includes('@') ? GITHUB_REPO : resolvedRepo;
+}
+
+function syncCodexPluginRegistration(source: string): string[] {
+  const lines: string[] = [];
+
+  try {
+    execFileSync('which', ['codex'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch {
+    lines.push('- codex_cli: skipped (codex binary not found)');
+    return lines;
+  }
+
+  const commands: [string[], string][] = [
+    [['codex', 'plugin', 'marketplace', 'add', source], 'marketplace_add'],
+    [['codex', 'plugin', 'add', `${PLUGIN_NAME}@${CODEX_MARKETPLACE_NAME}`], 'plugin_add'],
+  ];
+
+  for (const [cmd, label] of commands) {
+    const { code, output } = runCodexCommand(cmd);
+    if (code === 0 || looksLikeCodexAlready(output)) {
+      lines.push(`- codex_cli_${label}: ok`);
+    } else {
+      lines.push(`- codex_cli_${label}: failed`);
+      if (output) {
+        lines.push(`  output: ${output}`);
+      }
+    }
+  }
+
+  return lines;
+}
+
+function unsyncCodexPluginRegistration(): string[] {
+  const lines: string[] = [];
+
+  try {
+    execFileSync('which', ['codex'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch {
+    lines.push('- codex_cli: skipped (codex binary not found)');
+    return lines;
+  }
+
+  // `codex plugin remove` only removes the plugin; the marketplace is removed
+  // separately. Order matters: remove the plugin first, then the marketplace.
+  const commands: [string[], string][] = [
+    [['codex', 'plugin', 'remove', `${PLUGIN_NAME}@${CODEX_MARKETPLACE_NAME}`], 'plugin_remove'],
+    [['codex', 'plugin', 'marketplace', 'remove', CODEX_MARKETPLACE_NAME], 'marketplace_remove'],
+  ];
+
+  for (const [cmd, label] of commands) {
+    const { code, output } = runCodexCommand(cmd);
+    if (code === 0 || looksLikeCodexAlready(output)) {
+      lines.push(`- codex_cli_${label}: ok`);
+    } else {
+      lines.push(`- codex_cli_${label}: failed`);
+      if (output) {
+        lines.push(`  output: ${output}`);
+      }
+    }
+  }
+
+  return lines;
+}
+
+function installClaude(
+  repoRoot: string,
+  mode: string,
+  force: boolean,
+  claudeHome?: string,
+): { status: string; targetPath: string } {
+  const target = claudeTarget(claudeHome);
+  const status = installPath(repoRoot, target, mode, force);
+  return { status, targetPath: target };
+}
+
+function installOpenCode(
+  repoRoot: string,
+  mode: string,
+  force: boolean,
+  opencodeHome?: string,
+): string[] {
+  const lines: string[] = [];
+
+  // Auto-clean legacy artifacts before installing the active set, so users
+  // who previously had a now-dropped skill (e.g. phone-a-team) don't keep
+  // stale files in ~/.config/opencode/.
+  //
+  // Only remove PaF-owned symlinks. User-authored files at the same path
+  // (e.g. someone manually wrote their own phone-a-team skill for OpenCode)
+  // are left alone — silently deleting them would be surprising.
+  for (const name of OPENCODE_LEGACY_SKILLS) {
+    const skillTarget = opencodeSkillTarget(name, opencodeHome);
+    const commandTarget = opencodeCommandTarget(name, opencodeHome);
+    if (isStalePafSymlink(skillTarget, repoRoot)) {
+      removePath(skillTarget);
+      lines.push(`- opencode_skill:${name}: removed (legacy, no longer supported in OpenCode)`);
+    } else if (existsSync(skillTarget)) {
+      lines.push(`- opencode_skill:${name}: kept (user-authored, not PaF-owned; remove manually if desired)`);
+    }
+    if (isStalePafSymlink(commandTarget, repoRoot)) {
+      removePath(commandTarget);
+      lines.push(`- opencode_command:${name}: removed (legacy, no longer supported in OpenCode)`);
+    } else if (existsSync(commandTarget)) {
+      lines.push(`- opencode_command:${name}: kept (user-authored, not PaF-owned; remove manually if desired)`);
+    }
+  }
+
+  for (const name of OPENCODE_SKILLS) {
+    const skillSource = join(repoRoot, 'skills', name);
+    const commandSource = opencodeCommandSource(repoRoot, name);
+
+    if (!existsSync(join(skillSource, 'SKILL.md'))) {
+      throw new InstallerError(`Missing OpenCode skill source: ${join(skillSource, 'SKILL.md')}`);
+    }
+    if (!existsSync(commandSource)) {
+      throw new InstallerError(`Missing OpenCode command source: ${commandSource}`);
+    }
+
+    const skillTarget = opencodeSkillTarget(name, opencodeHome);
+    const skillForce = force || isStalePafSymlink(skillTarget, repoRoot);
+    const skillStatus = installPath(skillSource, skillTarget, mode, skillForce);
+    lines.push(`- opencode_skill:${name}: ${skillStatus} -> ${skillTarget}`);
+
+    const commandTarget = opencodeCommandTarget(name, opencodeHome);
+    const commandForce = force || isStalePafSymlink(commandTarget, repoRoot);
+    const commandStatus = installPath(commandSource, commandTarget, mode, commandForce);
+    lines.push(`- opencode_command:${name}: ${commandStatus} -> ${commandTarget}`);
+  }
+
+  return lines;
+}
+
+function installCodex(
+  repoRoot: string,
+  mode: string,
+  force: boolean,
+  codexHome?: string,
+): string[] {
+  const lines: string[] = [];
+
+  // Reserved for symmetric legacy cleanup (none today). If a future PaF
+  // version drops a Codex skill, list it in CODEX_LEGACY_SKILLS and the
+  // same OpenCode-style ownership-checked removal applies.
+  for (const name of CODEX_LEGACY_SKILLS) {
+    const skillTarget = codexSkillTarget(name, codexHome);
+    if (isStalePafSymlink(skillTarget, repoRoot)) {
+      removePath(skillTarget);
+      lines.push(`- codex_skill:${name}: removed (legacy, no longer supported in Codex)`);
+    } else if (existsSync(skillTarget)) {
+      lines.push(`- codex_skill:${name}: kept (user-authored, not PaF-owned; remove manually if desired)`);
+    }
+  }
+
+  for (const name of CODEX_SKILLS) {
+    const skillSource = codexSkillSource(repoRoot, name);
+
+    if (!existsSync(join(skillSource, 'SKILL.md'))) {
+      throw new InstallerError(`Missing Codex skill source: ${join(skillSource, 'SKILL.md')}`);
+    }
+
+    const skillTarget = codexSkillTarget(name, codexHome);
+    const skillForce = force || isStalePafSymlink(skillTarget, repoRoot);
+    const skillStatus = installPath(skillSource, skillTarget, mode, skillForce);
+    lines.push(`- codex_skill:${name}: ${skillStatus} -> ${skillTarget}`);
+  }
+
+  // Best-effort cleanup of any previously-installed paf-* subagent symlinks
+  // from the earlier (now-dropped) subagent design. Only removes PaF-owned
+  // symlinks pointing back into this repo; never touches user-authored
+  // agents at $CODEX_HOME/agents/.
+  const legacyAgentsDir = join(codexConfigRoot(codexHome), 'agents');
+  for (const legacy of ['paf-reviewer', 'paf-critic', 'paf-synthesizer']) {
+    const legacyTarget = join(legacyAgentsDir, `${legacy}.toml`);
+    if (isStalePafSymlink(legacyTarget, repoRoot)) {
+      removePath(legacyTarget);
+      lines.push(`- codex_agent:${legacy}: removed (legacy subagent design, no longer shipped)`);
+    }
+  }
+
+  return lines;
+}
+
+function installPi(
+  repoRoot: string,
+  mode: string,
+  force: boolean,
+  piHome?: string,
+): string[] {
+  const lines: string[] = [];
+  for (const name of PI_SKILLS) {
+    const skillSource = join(repoRoot, 'skills', name);
+    if (!existsSync(join(skillSource, 'SKILL.md'))) {
+      throw new InstallerError(`Missing pi skill source: ${join(skillSource, 'SKILL.md')}`);
+    }
+    const skillTarget = piSkillTarget(name, piHome);
+    // A symlink PaF made from another install location is relinked without
+    // --force; anything else in the way needs the flag.
+    const skillForce = force || (isSymlink(skillTarget) && isPafOwnedPiSkill(skillTarget, name, repoRoot));
+    const skillStatus = installPath(skillSource, skillTarget, mode, skillForce);
+    if (skillStatus === 'installed' && mode === 'copy') {
+      writeFileSync(join(skillTarget, PI_INSTALL_MARKER), `${PAF_NPM_NAME}\n`);
+    }
+    lines.push(`- pi_skill:${name}: ${skillStatus} -> ${skillTarget}`);
+  }
+  return lines;
+}
+
+function installGrok(
+  repoRoot: string,
+  mode: string,
+  force: boolean,
+  grokHome?: string,
+): string[] {
+  const lines: string[] = [];
+  for (const name of GROK_SKILLS) {
+    const skillSource = grokSkillSource(repoRoot, name);
+    if (!existsSync(join(skillSource, 'SKILL.md'))) {
+      throw new InstallerError(`Missing Grok skill source: ${join(skillSource, 'SKILL.md')}`);
+    }
+    const skillTarget = grokSkillTarget(name, grokHome);
+    const skillForce = force || (isSymlink(skillTarget) && isPafOwnedPiSkill(skillTarget, name, repoRoot));
+    const skillStatus = installPath(skillSource, skillTarget, mode, skillForce);
+    if (skillStatus === 'installed' && mode === 'copy') {
+      writeFileSync(join(skillTarget, PI_INSTALL_MARKER), `${PAF_NPM_NAME}\n`);
+    }
+    lines.push(`- grok_skill:${name}: ${skillStatus} -> ${skillTarget}`);
+  }
+  return lines;
+}
+
+/** `filePath` with symlinks resolved as far as it exists, so a removed target still compares. */
+function canonicalPath(filePath: string): string {
+  let existing = resolve(filePath);
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      return join(realpathSync(existing), ...missing);
+    } catch {
+      const parent = dirname(existing);
+      if (parent === existing) return resolve(filePath);
+      missing.unshift(existing.slice(parent.length).replace(/^[\\/]+/, ''));
+      existing = parent;
+    }
+  }
+}
+
+/**
+ * True when the pi skill at `target` was put there by PaF: a copy carrying
+ * the install marker, a symlink to exactly `<this install>/skills/<name>`,
+ * or a symlink to `<dir>/skills/<name>` (including `.grok` / `.codex`
+ * overlays) where `<dir>` is a PaF package by
+ * its package.json. A symlink to some other place inside the repository is
+ * the user's, the path's shape alone proves nothing, and a dangling symlink
+ * into another location has nothing left to check.
+ */
+function isPafOwnedPiSkill(target: string, name: string, repoRoot?: string): boolean {
+  if (!isSymlink(target)) return existsSync(join(target, PI_INSTALL_MARKER));
+  try {
+    const link = readlinkSync(target);
+    const absolute = isAbsolute(link) ? link : resolve(dirname(target), link);
+    if (repoRoot) {
+      const owned = [
+        join(repoRoot, 'skills', name),
+        join(repoRoot, 'skills', name, '.grok'),
+        join(repoRoot, 'skills', name, '.codex'),
+      ];
+      if (owned.some((candidate) => canonicalPath(absolute) === canonicalPath(candidate))) return true;
+    }
+    const skillDir = ['.grok', '.codex'].includes(basename(absolute)) ? dirname(absolute) : absolute;
+    const skillsDir = dirname(skillDir);
+    if (skillDir !== join(skillsDir, name) || skillsDir !== join(dirname(skillsDir), 'skills')) return false;
+    return isPafPackageDir(dirname(skillsDir));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Unlike the OpenCode and Codex uninstallers, this one removes only what it
+ * can show PaF installed: a user may keep a skill of their own under the same
+ * name.
+ */
+function uninstallPi(piHome?: string, repoRoot?: string): string[] {
+  return PI_SKILLS.map((name) => {
+    const target = piSkillTarget(name, piHome);
+    if (!existsSync(target) && !isSymlink(target)) return `- pi_skill:${name}: not-installed`;
+    if (!isPafOwnedPiSkill(target, name, repoRoot)) {
+      return `- pi_skill:${name}: kept (not PaF-owned; remove manually if desired)`;
+    }
+    removePath(target);
+    return `- pi_skill:${name}: removed`;
+  });
+}
+
+function uninstallGrok(grokHome?: string, repoRoot?: string): string[] {
+  return GROK_SKILLS.map((name) => {
+    const target = grokSkillTarget(name, grokHome);
+    if (!existsSync(target) && !isSymlink(target)) return `- grok_skill:${name}: not-installed`;
+    if (!isPafOwnedPiSkill(target, name, repoRoot)) {
+      return `- grok_skill:${name}: kept (not PaF-owned; remove manually if desired)`;
+    }
+    removePath(target);
+    return `- grok_skill:${name}: removed`;
+  });
+}
+
+function uninstallCodex(codexHome?: string, repoRoot?: string): string[] {
+  const lines: string[] = [];
+  for (const name of CODEX_SKILLS) {
+    const skillTarget = codexSkillTarget(name, codexHome);
+    lines.push(`- codex_skill:${name}: ${uninstallPath(skillTarget)}`);
+  }
+  for (const name of CODEX_LEGACY_SKILLS) {
+    const skillTarget = codexSkillTarget(name, codexHome);
+    if (repoRoot && isStalePafSymlink(skillTarget, repoRoot)) {
+      removePath(skillTarget);
+      lines.push(`- codex_skill:${name}: removed (legacy)`);
+    } else if (existsSync(skillTarget) || isSymlink(skillTarget)) {
+      lines.push(`- codex_skill:${name}: kept (user-authored, not PaF-owned; remove manually if desired)`);
+    } else {
+      lines.push(`- codex_skill:${name}: not-installed`);
+    }
+  }
+  // Clean up legacy paf-* subagent symlinks from the earlier subagent
+  // design, but only when they are PaF-owned symlinks. Don't touch
+  // user-authored TOML files at the same path; the names are distinctive
+  // but not reserved, and clobbering a real file during uninstall would be
+  // a destructive surprise.
+  const legacyAgentsDir = join(codexConfigRoot(codexHome), 'agents');
+  for (const legacy of ['paf-reviewer', 'paf-critic', 'paf-synthesizer']) {
+    const legacyTarget = join(legacyAgentsDir, `${legacy}.toml`);
+    if (repoRoot && isStalePafSymlink(legacyTarget, repoRoot)) {
+      removePath(legacyTarget);
+      lines.push(`- codex_agent:${legacy}: removed (legacy subagent design)`);
+    } else if (existsSync(legacyTarget) || isSymlink(legacyTarget)) {
+      lines.push(`- codex_agent:${legacy}: kept (not PaF-owned; remove manually if desired)`);
+    }
+  }
+  return lines;
+}
+
+function uninstallPath(filePath: string): string {
+  if (existsSync(filePath) || isSymlink(filePath)) {
+    removePath(filePath);
+    return 'removed';
+  }
+  return 'not-installed';
+}
+
+function uninstallClaude(claudeHome?: string): { status: string; targetPath: string } {
+  const target = claudeTarget(claudeHome);
+  return { status: uninstallPath(target), targetPath: target };
+}
+
+function uninstallOpenCode(opencodeHome?: string, repoRoot?: string): string[] {
+  const lines: string[] = [];
+  // Active skills (phone-a-friend, curiosity-engine): the user explicitly
+  // opted to uninstall PaF's OpenCode integration, so remove unconditionally.
+  for (const name of OPENCODE_SKILLS) {
+    const skillTarget = opencodeSkillTarget(name, opencodeHome);
+    lines.push(`- opencode_skill:${name}: ${uninstallPath(skillTarget)}`);
+
+    const commandTarget = opencodeCommandTarget(name, opencodeHome);
+    lines.push(`- opencode_command:${name}: ${uninstallPath(commandTarget)}`);
+  }
+  // Legacy skills (phone-a-team): preserve user-authored files. Only remove
+  // when ownership can be verified (PaF symlink into the current repo). If
+  // we can't verify ownership (no repoRoot, or the file is a plain user
+  // file), keep it and surface a "kept" log line.
+  for (const name of OPENCODE_LEGACY_SKILLS) {
+    const skillTarget = opencodeSkillTarget(name, opencodeHome);
+    if (repoRoot && isStalePafSymlink(skillTarget, repoRoot)) {
+      removePath(skillTarget);
+      lines.push(`- opencode_skill:${name}: removed (legacy)`);
+    } else if (existsSync(skillTarget) || isSymlink(skillTarget)) {
+      lines.push(`- opencode_skill:${name}: kept (user-authored, not PaF-owned; remove manually if desired)`);
+    } else {
+      lines.push(`- opencode_skill:${name}: not-installed`);
+    }
+    const commandTarget = opencodeCommandTarget(name, opencodeHome);
+    if (repoRoot && isStalePafSymlink(commandTarget, repoRoot)) {
+      removePath(commandTarget);
+      lines.push(`- opencode_command:${name}: removed (legacy)`);
+    } else if (existsSync(commandTarget) || isSymlink(commandTarget)) {
+      lines.push(`- opencode_command:${name}: kept (user-authored, not PaF-owned; remove manually if desired)`);
+    } else {
+      lines.push(`- opencode_command:${name}: not-installed`);
+    }
+  }
+  return lines;
+}
+
+function isValidRepoRoot(repoRoot: string): boolean {
+  return existsSync(join(repoRoot, '.claude-plugin', 'plugin.json'));
+}
+
+// ---------------------------------------------------------------------------
+// Claude marketplace source
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the Claude marketplace is (or would be) registered from.
+ *
+ * `claude plugin marketplace add` is idempotent on the marketplace *name*: a
+ * second add from a different source prints "already on disk", exits 0 and
+ * keeps the first source. PaF therefore compares sources itself before adding,
+ * instead of trusting the add to repoint a stale registration.
+ */
+export type ClaudeMarketplaceSource =
+  | { kind: 'github'; repo: string }
+  | { kind: 'directory'; path: string }
+  | { kind: 'other'; type: string };
+
+/**
+ * The source this install registers. An npm-style install (any path with a
+ * `node_modules` segment: npm, pnpm, Volta, Homebrew's Node formulas) uses the
+ * GitHub repository, because its folder changes whenever the Node install
+ * does (nvm, fnm, a Homebrew upgrade) and a folder registration would go
+ * stale silently. A checkout registers its own folder so local edits load.
+ */
+export function claudeMarketplaceSource(resolvedRepo: string): ClaudeMarketplaceSource {
+  return resolvedRepo.split(sep).includes('node_modules')
+    ? { kind: 'github', repo: GITHUB_REPO }
+    : { kind: 'directory', path: resolvedRepo };
+}
+
+function sourceArgument(source: ClaudeMarketplaceSource): string | null {
+  if (source.kind === 'github') return source.repo;
+  if (source.kind === 'directory') return source.path;
+  return null;
+}
+
+export function describeClaudeMarketplaceSource(source: ClaudeMarketplaceSource): string {
+  if (source.kind === 'github') return `GitHub ${source.repo}`;
+  if (source.kind === 'directory') return `folder ${source.path}`;
+  return `a ${source.type} source`;
+}
+
+function canonicalDir(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+function sameClaudeMarketplaceSource(a: ClaudeMarketplaceSource, b: ClaudeMarketplaceSource): boolean {
+  if (a.kind === 'github' && b.kind === 'github') return a.repo.toLowerCase() === b.repo.toLowerCase();
+  if (a.kind === 'directory' && b.kind === 'directory') return canonicalDir(a.path) === canonicalDir(b.path);
+  return false;
+}
+
+/** The registered source of `marketplaceName` in Claude's registry, or null when absent or unreadable. */
+export function registeredClaudeMarketplace(
+  marketplaceName: string = MARKETPLACE_NAME,
+  claudeHome?: string,
+): ClaudeMarketplaceSource | null {
+  const registryPath = join(claudeConfigRoot(claudeHome), 'plugins', 'known_marketplaces.json');
+  try {
+    const source = JSON.parse(readFileSync(registryPath, 'utf-8'))?.[marketplaceName]?.source;
+    if (!source || typeof source.source !== 'string') return null;
+    if (source.source === 'github' && typeof source.repo === 'string') return { kind: 'github', repo: source.repo };
+    if (source.source === 'directory' && typeof source.path === 'string') return { kind: 'directory', path: source.path };
+    return { kind: 'other', type: source.source };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check if the marketplace is already registered with a remote (non-directory) source.
+ * Returns the source type (e.g. "github", "git", "npm") if remote, or null if
+ * local/directory or not registered.
+ */
+export function getMarketplaceSourceType(
+  marketplaceName: string = MARKETPLACE_NAME,
+  claudeHome?: string,
+): string | null {
+  const registered = registeredClaudeMarketplace(marketplaceName, claudeHome);
+  if (!registered || registered.kind === 'directory') return null;
+  return registered.kind === 'github' ? 'github' : registered.type;
+}
+
+export interface ClaudeMarketplaceStatus {
+  registered: ClaudeMarketplaceSource | null;
+  expected: ClaudeMarketplaceSource;
+  matches: boolean;
+  /** A folder registration whose folder no longer exists. */
+  missingPath: boolean;
+  /** A stale registration PaF may repoint without asking: see {@link isPafOwnedRegistration}. */
+  pafOwned: boolean;
+}
+
+/**
+ * A folder registration PaF can prove it made: this install's own folder, or
+ * another npm-style PaF install (a `node_modules` path whose package.json
+ * names PaF's package, such as the install of a previous Node version).
+ * A missing folder, a checkout or a fork proves nothing and is left to the
+ * user.
+ */
+function isPafOwnedRegistration(registered: ClaudeMarketplaceSource, resolvedRepo: string): boolean {
+  if (registered.kind !== 'directory') return false;
+  if (canonicalDir(registered.path) === canonicalDir(resolvedRepo)) return true;
+  if (!registered.path.split(sep).includes('node_modules')) return false;
+  try {
+    return JSON.parse(readFileSync(join(registered.path, 'package.json'), 'utf-8'))?.name === PAF_NPM_NAME;
+  } catch {
+    return false;
+  }
+}
+
+export function claudeMarketplaceStatus(repoRoot: string, claudeHome?: string): ClaudeMarketplaceStatus {
+  const resolvedRepo = resolve(repoRoot);
+  const expected = claudeMarketplaceSource(resolvedRepo);
+  const registered = registeredClaudeMarketplace(MARKETPLACE_NAME, claudeHome);
+  const matches = registered !== null && sameClaudeMarketplaceSource(registered, expected);
+  return {
+    registered,
+    expected,
+    matches,
+    missingPath: registered?.kind === 'directory' && !existsSync(registered.path),
+    pafOwned: registered !== null && !matches && isPafOwnedRegistration(registered, resolvedRepo),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Ownership record
+// ---------------------------------------------------------------------------
+
+/**
+ * PaF records the source it registered, so uninstall can tell a marketplace
+ * PaF added (removed with PaF) from one the user added (left alone). The
+ * registry alone cannot: a GitHub registration looks the same either way.
+ */
+function marketplaceRecordPath(pafHome?: string): string {
+  return join(pafHome ?? pafConfigDir(), 'claude-marketplace.json');
+}
+
+function readMarketplaceRecord(pafHome?: string): ClaudeMarketplaceSource | null {
+  try {
+    const source = JSON.parse(readFileSync(marketplaceRecordPath(pafHome), 'utf-8'))?.source;
+    if (source?.kind === 'github' && typeof source.repo === 'string') return { kind: 'github', repo: source.repo };
+    if (source?.kind === 'directory' && typeof source.path === 'string') return { kind: 'directory', path: source.path };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function writeMarketplaceRecord(source: ClaudeMarketplaceSource, pafHome?: string): void {
+  try {
+    const path = marketplaceRecordPath(pafHome);
+    ensureParent(path);
+    writeFileSync(path, `${JSON.stringify({ source }, null, 2)}\n`);
+  } catch {
+    // Best-effort: without the record, uninstall falls back to the registry check.
+  }
+}
+
+function clearMarketplaceRecord(pafHome?: string): void {
+  try {
+    removePath(marketplaceRecordPath(pafHome));
+  } catch {
+    // Best-effort.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Repointing a stale registration
+// ---------------------------------------------------------------------------
+
+interface ClaudePluginInstall {
+  plugin: string;
+  scope: string;
+  projectPath?: string;
+}
+
+/**
+ * Every install of PaF's two plugins in every scope, from Claude's
+ * installed_plugins.json, so a repoint can restore them: `marketplace remove`
+ * uninstalls a marketplace's plugins.
+ */
+function pafPluginInstalls(claudeHome?: string): ClaudePluginInstall[] {
+  const path = join(claudeConfigRoot(claudeHome), 'plugins', 'installed_plugins.json');
+  let plugins: Record<string, unknown>;
+  try {
+    plugins = JSON.parse(readFileSync(path, 'utf-8'))?.plugins ?? {};
+  } catch {
+    return [];
+  }
+  const installs: ClaudePluginInstall[] = [];
+  for (const plugin of [PLUGIN_NAME, MOD_PLUGIN_NAME]) {
+    const entries = plugins[`${plugin}@${MARKETPLACE_NAME}`];
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (typeof entry?.scope !== 'string') continue;
+      installs.push({
+        plugin,
+        scope: entry.scope,
+        ...(typeof entry.projectPath === 'string' ? { projectPath: entry.projectPath } : {}),
+      });
+    }
+  }
+  return installs;
+}
+
+/**
+ * `skipUserMain`: leave the user-scope phone-a-friend install to the regular
+ * sync that follows a successful repoint.
+ */
+function reinstallPafPlugins(installs: ClaudePluginInstall[], skipUserMain: boolean): string[] {
+  const lines: string[] = [];
+  for (const install of installs) {
+    if (skipUserMain && install.plugin === PLUGIN_NAME && install.scope === 'user') continue;
+    const where = install.projectPath ? `${install.scope} ${install.projectPath}` : install.scope;
+    const label = `claude_cli_reinstall:${install.plugin} (${where})`;
+    if (install.scope !== 'user' && !(install.projectPath && existsSync(install.projectPath))) {
+      lines.push(`- ${label}: skipped (project folder not found)`);
+      continue;
+    }
+    const { code, output } = runClaudeCommand(
+      ['claude', 'plugin', 'install', `${install.plugin}@${MARKETPLACE_NAME}`, '-s', install.scope],
+      install.scope === 'user' ? undefined : install.projectPath,
+    );
+    if (code === 0 || looksLikeOkIfAlready(output)) {
+      lines.push(`- ${label}: ok`);
+    } else {
+      lines.push(`- ${label}: failed`);
+      if (output) lines.push(`  output: ${output}`);
+    }
+  }
+  return lines;
+}
+
+/**
+ * Update every existing paf-tasks install. The regular sync updates only
+ * phone-a-friend, and auto-update is off by default for third-party
+ * marketplaces, so without this the panel stays on the version first
+ * installed. Installs just restored by a repoint are already current.
+ */
+function updateModPlugin(reinstalled: ClaudePluginInstall[], claudeHome?: string): string[] {
+  const lines: string[] = [];
+  for (const install of pafPluginInstalls(claudeHome)) {
+    if (install.plugin !== MOD_PLUGIN_NAME) continue;
+    if (reinstalled.some(r => r.plugin === install.plugin && r.scope === install.scope
+      && r.projectPath === install.projectPath)) continue;
+    const where = install.projectPath ? `${install.scope} ${install.projectPath}` : install.scope;
+    const label = `claude_cli_update:${install.plugin} (${where})`;
+    if (install.scope !== 'user' && !(install.projectPath && existsSync(install.projectPath))) {
+      lines.push(`- ${label}: skipped (project folder not found)`);
+      continue;
+    }
+    const { code, output } = runClaudeCommand(
+      ['claude', 'plugin', 'update', `${install.plugin}@${MARKETPLACE_NAME}`, '-s', install.scope],
+      install.scope === 'user' ? undefined : install.projectPath,
+    );
+    if (code === 0 || looksLikeOkIfAlready(output)) {
+      lines.push(`- ${label}: ok`);
+    } else {
+      lines.push(`- ${label}: failed`);
+      if (output) lines.push(`  output: ${output}`);
+    }
+  }
+  return lines;
+}
+
+/**
+ * Replace a registration with `target`. Claude has no "change source", and a
+ * repeat add keeps the old one, so this removes the marketplace and adds it
+ * from `target`. `marketplace remove` uninstalls the marketplace's plugins:
+ * the caller reinstalls `installs` once the regular sync has run. When the
+ * add fails, the previous folder source is restored (with its plugins) so
+ * the user is not left without a marketplace.
+ */
+function repointClaudeMarketplace(
+  previous: ClaudeMarketplaceSource,
+  target: ClaudeMarketplaceSource,
+  claudeHome?: string,
+): { lines: string[]; ok: boolean; installs: ClaudePluginInstall[] } {
+  const lines = [
+    `- claude_cli_marketplace_repoint: ${describeClaudeMarketplaceSource(previous)} -> ${describeClaudeMarketplaceSource(target)}`,
+  ];
+  const installs = pafPluginInstalls(claudeHome);
+  const remove = runClaudeCommand(['claude', 'plugin', 'marketplace', 'remove', MARKETPLACE_NAME]);
+  if (remove.code !== 0) {
+    lines.push('- claude_cli_marketplace_remove: failed');
+    if (remove.output) lines.push(`  output: ${remove.output}`);
+    return { lines, ok: false, installs };
+  }
+  lines.push('- claude_cli_marketplace_remove: ok');
+
+  const add = runClaudeCommand(['claude', 'plugin', 'marketplace', 'add', sourceArgument(target)!]);
+  if (add.code !== 0) {
+    lines.push('- claude_cli_marketplace_add: failed');
+    if (add.output) lines.push(`  output: ${add.output}`);
+    const restore = previous.kind === 'directory' && existsSync(previous.path)
+      ? runClaudeCommand(['claude', 'plugin', 'marketplace', 'add', previous.path])
+      : null;
+    if (restore?.code === 0) {
+      lines.push(`- claude_cli_marketplace_restore: ok (${describeClaudeMarketplaceSource(previous)})`);
+      lines.push(...reinstallPafPlugins(installs, false));
+    } else {
+      lines.push(`  Re-add it by hand: claude plugin marketplace add ${GITHUB_REPO}`);
+    }
+    return { lines, ok: false, installs };
+  }
+  lines.push(`- claude_cli_marketplace_add: ok (${describeClaudeMarketplaceSource(target)})`);
+  return { lines, ok: true, installs };
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Register (or keep in sync) the Claude marketplace from `target`.
+ *
+ * - Not registered, or registered from `target`: the regular add/update/install.
+ * - Registered elsewhere: repointed when PaF owns the old registration or the
+ *   caller forces it; otherwise left alone with the command that fixes it.
+ */
+function syncClaudeMarketplace(opts: {
+  target: ClaudeMarketplaceSource;
+  resolvedRepo?: string;
+  force: boolean;
+  claudeHome?: string;
+  pafHome?: string;
+}): string[] {
+  const { target, resolvedRepo, force, claudeHome, pafHome } = opts;
+  const registered = registeredClaudeMarketplace(MARKETPLACE_NAME, claudeHome);
+  const lines: string[] = [];
+  let reinstall: ClaudePluginInstall[] = [];
+
+  if (registered && !sameClaudeMarketplaceSource(registered, target)) {
+    const owned = resolvedRepo !== undefined && isPafOwnedRegistration(registered, resolvedRepo);
+    if (!owned && !force) {
+      const missing = registered.kind === 'directory' && !existsSync(registered.path)
+        ? ' (that folder no longer exists)'
+        : '';
+      lines.push(
+        `- claude_cli_sync: skipped (${MARKETPLACE_NAME} is registered from ` +
+          `${describeClaudeMarketplaceSource(registered)}${missing}; this install uses ` +
+          `${describeClaudeMarketplaceSource(target)})`,
+      );
+      lines.push(
+        '  Run `phone-a-friend plugin update --claude --force-marketplace-sync` to switch it; ' +
+          'installed phone-a-friend and paf-tasks plugins are reinstalled.',
+      );
+      return lines;
+    }
+    if (!commandAvailable('claude')) {
+      lines.push('- claude_cli: skipped (claude binary not found)');
+      return lines;
+    }
+    const repoint = repointClaudeMarketplace(registered, target, claudeHome);
+    lines.push(...repoint.lines);
+    if (!repoint.ok) return lines;
+    reinstall = repoint.installs;
+  }
+
+  lines.push(...cleanupLegacyMarketplace());
+  const sync = syncClaudePluginRegistration(sourceArgument(target)!);
+  lines.push(...sync);
+  lines.push(...reinstallPafPlugins(reinstall, true));
+  if (!sync.some(l => l.startsWith('- claude_cli: skipped'))) {
+    lines.push(...updateModPlugin(reinstall, claudeHome));
+  }
+  if (!sync.some(l => l.startsWith('- claude_cli: skipped')) && !sync.some(l => l.includes('marketplace_add: failed'))) {
+    writeMarketplaceRecord(target, pafHome);
+  }
+  return lines;
+}
+
+function commandAvailable(command: string): boolean {
+  try {
+    execFileSync('which', [command], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Install the plugin via GitHub marketplace (npm source).
+ * Cleans up any existing local symlink, removes legacy marketplace,
+ * and registers via the GitHub-hosted marketplace. An existing folder
+ * registration is repointed, since switching to GitHub is what was asked.
+ */
+export function installFromGitHubMarketplace(opts: { claudeHome?: string; pafHome?: string } = {}): string[] {
+  const lines: string[] = [];
+  // Only remove local symlink; skip marketplace unsync since we re-register immediately
+  lines.push(...uninstallHosts({ target: 'claude', claudeCliUnsync: 'never', claudeHome: opts.claudeHome }));
+  lines.push(...syncClaudeMarketplace({
+    target: { kind: 'github', repo: GITHUB_REPO },
+    force: true,
+    claudeHome: opts.claudeHome,
+    pafHome: opts.pafHome,
+  }));
+  return lines;
+}
+
+export interface InstallOptions {
+  repoRoot: string;
+  target: InstallTarget;
+  mode?: 'symlink' | 'copy';
+  force?: boolean;
+  claudeHome?: string;
+  opencodeHome?: string;
+  codexHome?: string;
+  /** pi's agent directory. Defaults to `PI_CODING_AGENT_DIR`, then `~/.pi/agent`. */
+  piHome?: string;
+  /** Grok config root. Skills go in `<grokHome>/skills`. Defaults to `~/.grok`. */
+  grokHome?: string;
+  syncClaudeCli?: boolean;
+  /**
+   * Whether to register the plugin via `codex plugin marketplace add` +
+   * `codex plugin add`. Default true; set false to skip the shell-out for CI
+   * or sandboxed environments. Loose-file install of skills + agents always
+   * runs regardless of this flag.
+   */
+  syncCodexCli?: boolean;
+  /**
+   * Repoint a Claude marketplace registered from another source even when PaF
+   * cannot prove it made that registration (a checkout, a fork, a missing
+   * folder, a different remote).
+   */
+  forceMarketplaceSync?: boolean;
+  /** PaF's config directory, for the marketplace ownership record. Defaults to `pafConfigDir()`. */
+  pafHome?: string;
+}
+
+export function installHosts(opts: InstallOptions): string[] {
+  const {
+    repoRoot,
+    target,
+    mode = 'symlink',
+    force = false,
+    claudeHome,
+    opencodeHome,
+    codexHome,
+    piHome,
+    grokHome,
+    syncClaudeCli = true,
+    syncCodexCli = true,
+    forceMarketplaceSync = false,
+    pafHome,
+  } = opts;
+
+  if (!INSTALL_TARGETS.has(target)) {
+    throw new InstallerError(`Invalid target: ${target}`);
+  }
+  if (!INSTALL_MODES.has(mode)) {
+    throw new InstallerError(`Invalid mode: ${mode}`);
+  }
+
+  const resolvedRepo = resolve(repoRoot);
+  if (!isValidRepoRoot(resolvedRepo)) {
+    throw new InstallerError(`Invalid repo root: ${resolvedRepo}`);
+  }
+
+  const lines = [
+    'phone-a-friend installer',
+    `- repo_root: ${resolvedRepo}`,
+    `- mode: ${mode}`,
+  ];
+
+  const shouldInstallClaude = target === 'claude' || target === 'all';
+  const shouldInstallOpenCode = target === 'opencode' || target === 'all';
+  const shouldInstallCodex = target === 'codex' || target === 'all';
+  const shouldInstallPi = target === 'pi' || target === 'all';
+  const shouldInstallGrok = target === 'grok' || target === 'all';
+
+  if (shouldInstallClaude) {
+    const { status, targetPath } = installClaude(resolvedRepo, mode, force, claudeHome);
+    lines.push(`- claude: ${status} -> ${targetPath}`);
+  }
+
+  if (shouldInstallOpenCode) {
+    lines.push(...installOpenCode(resolvedRepo, mode, force, opencodeHome));
+  }
+
+  if (shouldInstallCodex) {
+    lines.push(...installCodex(resolvedRepo, mode, force, codexHome));
+  }
+
+  if (shouldInstallPi) {
+    lines.push(...installPi(resolvedRepo, mode, force, piHome));
+  }
+
+  if (shouldInstallGrok) {
+    lines.push(...installGrok(resolvedRepo, mode, force, grokHome));
+  }
+
+  if (shouldInstallClaude && syncClaudeCli) {
+    lines.push(...syncClaudeMarketplace({
+      target: claudeMarketplaceSource(resolvedRepo),
+      resolvedRepo,
+      force: forceMarketplaceSync,
+      claudeHome,
+      pafHome,
+    }));
+  }
+
+  if (shouldInstallCodex && syncCodexCli) {
+    lines.push(...syncCodexPluginRegistration(codexMarketplaceSource(resolvedRepo)));
+  }
+
+  return lines;
+}
+
+export interface UninstallOptions {
+  target: InstallTarget;
+  claudeHome?: string;
+  opencodeHome?: string;
+  codexHome?: string;
+  /** pi's agent directory. Defaults to `PI_CODING_AGENT_DIR`, then `~/.pi/agent`. */
+  piHome?: string;
+  /** Grok config root. Skills live in `<grokHome>/skills`. Defaults to `~/.grok`. */
+  grokHome?: string;
+  /**
+   * Repo root for PaF-ownership checks during legacy-skill cleanup. Optional;
+   * if absent, legacy artifacts at the user's path are preserved (safer
+   * default than deleting unverified files).
+   */
+  repoRoot?: string;
+  /**
+   * Controls whether marketplace registration is removed during uninstall.
+   * - 'auto' (default): skip unsync when marketplace has a remote source (github/npm/git),
+   *   proceed when local/directory or not registered.
+   * - 'always': unconditionally remove marketplace registration (--purge-marketplace).
+   * - 'never': never unsync (used internally when re-registering immediately after).
+   * A remote source PaF itself registered (per its ownership record) counts as PaF's.
+   */
+  claudeCliUnsync?: 'auto' | 'always' | 'never';
+  /** PaF's config directory, for the marketplace ownership record. Defaults to `pafConfigDir()`. */
+  pafHome?: string;
+  /**
+   * Controls whether Codex plugin + marketplace registration is removed.
+   * - 'auto' (default): proceed when `codex` is in PATH; no-op otherwise.
+   * - 'always': proceed; if `codex` missing, surface a skipped log line.
+   * - 'never': skip the codex-side shell-out entirely.
+   */
+  codexCliUnsync?: 'auto' | 'always' | 'never';
+}
+
+export function uninstallHosts(opts: UninstallOptions): string[] {
+  const {
+    target,
+    claudeHome,
+    opencodeHome,
+    codexHome,
+    piHome,
+    grokHome,
+    repoRoot,
+    claudeCliUnsync = 'auto',
+    codexCliUnsync = 'auto',
+    pafHome,
+  } = opts;
+
+  if (!INSTALL_TARGETS.has(target)) {
+    throw new InstallerError(`Invalid target: ${target}`);
+  }
+
+  const lines = ['phone-a-friend uninstaller'];
+
+  const shouldUninstallClaude = target === 'claude' || target === 'all';
+  const shouldUninstallOpenCode = target === 'opencode' || target === 'all';
+  const shouldUninstallCodex = target === 'codex' || target === 'all';
+  const shouldUninstallPi = target === 'pi' || target === 'all';
+  const shouldUninstallGrok = target === 'grok' || target === 'all';
+
+  if (shouldUninstallClaude) {
+    const { status } = uninstallClaude(claudeHome);
+    lines.push(`- claude: ${status}`);
+  }
+
+  if (shouldUninstallOpenCode) {
+    lines.push(...uninstallOpenCode(opencodeHome, repoRoot));
+  }
+
+  if (shouldUninstallCodex) {
+    lines.push(...uninstallCodex(codexHome, repoRoot));
+    if (codexCliUnsync !== 'never') {
+      lines.push(...unsyncCodexPluginRegistration());
+    } else {
+      lines.push('- codex_cli_unsync: skipped');
+    }
+  }
+
+  if (shouldUninstallPi) {
+    lines.push(...uninstallPi(piHome, repoRoot));
+  }
+
+  if (shouldUninstallGrok) {
+    lines.push(...uninstallGrok(grokHome, repoRoot));
+  }
+
+  if (!shouldUninstallClaude) {
+    return lines;
+  }
+
+  if (claudeCliUnsync === 'never') {
+    lines.push('- claude_cli_unsync: skipped');
+    return lines;
+  }
+
+  if (claudeCliUnsync === 'auto') {
+    const registered = registeredClaudeMarketplace(MARKETPLACE_NAME, claudeHome);
+    const record = readMarketplaceRecord(pafHome);
+    const registeredByPaf = registered !== null && record !== null && sameClaudeMarketplaceSource(registered, record);
+    if (registered && registered.kind !== 'directory' && !registeredByPaf) {
+      const type = registered.kind === 'github' ? 'github' : registered.type;
+      lines.push(`- claude_cli_unsync: skipped (marketplace registered via ${type})`);
+      lines.push(`  Use --purge-marketplace to force removal.`);
+      return lines;
+    }
+  }
+
+  // 'always', or 'auto' with a folder source, no source, or one PaF registered
+  const unsync = unsyncClaudePluginRegistration(MARKETPLACE_NAME, PLUGIN_NAME, claudeHome);
+  lines.push(...unsync);
+  if (unsync.some(l => l.includes('marketplace_remove: ok'))) clearMarketplaceRecord(pafHome);
+
+  return lines;
+}
+
+export interface BackendInfo {
+  name: string;
+  available: boolean;
+  hint: string;
+}
+
+export function verifyBackends(): BackendInfo[] {
+  const availability = checkBackends();
+  return Object.entries(availability).map(([name, available]) => ({
+    name,
+    available,
+    hint: INSTALL_HINTS[name] ?? '',
+  }));
+}

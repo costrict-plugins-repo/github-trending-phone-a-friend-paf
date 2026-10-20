@@ -1,0 +1,47 @@
+{
+  "name": "phone-a-friend",
+  "version": "4.14.1",
+  "description": "CLI relay that lets AI coding agents collaborate by sending prompts and repository context to backend agents.",
+  "author": {
+    "name": "Bruno Freiberger"
+  },
+  "homepage": "https://github.com/freibergergarcia/phone-a-friend#readme",
+  "repository": "https://github.com/freibergergarcia/phone-a-friend",
+  "license": "Apache-2.0",
+  "keywords": [
+    "ai-agent",
+    "claude-code",
+    "antigravity",
+    "codex",
+    "gemini",
+    "ollama",
+    "opencode",
+    "code-review",
+    "multi-agent",
+    "cli",
+    "pi"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Phone a Friend",
+    "shortDescription": "Second opinions for your code",
+    "longDescription": "Get second opinions and code reviews from Antigravity, Claude, Gemini, OpenCode, pi or Ollama while working in Codex. The phone-a-team skill runs iterative Bash-orchestrated rounds and lets the host model synthesize the results. Requires a local coding host with shell access, Node.js 22.13+, a PATH-installed phone-a-friend CLI, and separately configured backends. Plugin installation supplies skills; it does not install or authenticate backend CLIs. Hosted chat without local shell access cannot run these workflows. Provider charges and local history apply; see the privacy notice.",
+    "developerName": "Bruno Freiberger",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Ask Claude through phone-a-friend for a sanity review of this repo",
+      "Spin up reviewers across Claude and Gemini to debate this change",
+      "Iterate this implementation with phone-a-team across multiple backends"
+    ],
+    "composerIcon": "./assets/plugin-icon.svg",
+    "logo": "./assets/plugin-icon.svg",
+    "websiteURL": "https://github.com/freibergergarcia/phone-a-friend#readme",
+    "supportURL": "https://github.com/freibergergarcia/phone-a-friend/blob/main/SUPPORT.md",
+    "privacyPolicyURL": "https://github.com/freibergergarcia/phone-a-friend/blob/main/PRIVACY.md",
+    "brandColor": "#0369A1",
+    "brandColorDark": "#38BDF8"
+  }
+}

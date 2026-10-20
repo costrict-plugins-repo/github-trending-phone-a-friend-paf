@@ -1,0 +1,104 @@
+{
+  "name": "@freibergergarcia/phone-a-friend",
+  "version": "4.14.1",
+  "description": "CLI relay that lets AI coding agents collaborate",
+  "homepage": "https://github.com/freibergergarcia/phone-a-friend#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freibergergarcia/phone-a-friend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/freibergergarcia/phone-a-friend/issues"
+  },
+  "keywords": [
+    "ai-agent",
+    "antigravity",
+    "anthropic",
+    "claude-code",
+    "cli",
+    "codex",
+    "command-line-tool",
+    "developer-tools",
+    "gemini",
+    "generative-ai",
+    "llm",
+    "openai",
+    "ollama",
+    "typescript",
+    "opencode",
+    "pi",
+    "pi-package"
+  ],
+  "type": "module",
+  "bin": {
+    "phone-a-friend": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup && npm run plugins:sync",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsup src/index.ts --format esm --watch",
+    "bump:patch": "node scripts/bump-version.mjs patch",
+    "bump:minor": "node scripts/bump-version.mjs minor",
+    "bump:major": "node scripts/bump-version.mjs major",
+    "plugins:sync": "node scripts/sync-codex-plugin.mjs && node scripts/sync-claude-plugin.mjs",
+    "plugins:check": "node scripts/sync-codex-plugin.mjs --check && node scripts/sync-claude-plugin.mjs --check && node scripts/check-plugin-packages.mjs",
+    "plugins:pack": "npm run plugins:check && node scripts/pack-plugins.mjs"
+  },
+  "files": [
+    "dist/",
+    ".claude-plugin/",
+    ".codex-plugin/",
+    ".agents/",
+    "plugins/",
+    "skills/",
+    "commands/",
+    "agents/",
+    "mods/",
+    "README.md",
+    "LICENSE",
+    "assets/plugin-icon.svg",
+    "PRIVACY.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "NOTICE"
+  ],
+  "pi": {
+    "skills": [
+      "./skills/phone-a-friend",
+      "./skills/curiosity-engine"
+    ],
+    "extensions": [],
+    "prompts": [],
+    "themes": []
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "license": "Apache-2.0",
+  "author": "Bruno Freiberger",
+  "contributors": [
+    "ovidiul"
+  ],
+  "dependencies": {
+    "@inquirer/prompts": "^8.7.2",
+    "better-sqlite3": "^13.0.2",
+    "chalk": "^6.0.0",
+    "commander": "^15.0.0",
+    "ink": "^7.0.5",
+    "ora": "^9.3.0",
+    "react": "^19.3.0",
+    "react-devtools-core": "^8.0.0",
+    "smol-toml": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.5.1",
+    "@types/react": "^19.3.0",
+    "ink-testing-library": "^4.0.0",
+    "js-yaml": "^5.4.1",
+    "tsup": "^8.0.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
+  }
+}

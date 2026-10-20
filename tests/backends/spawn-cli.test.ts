@@ -1,0 +1,273 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import type { ChildProcess } from 'node:child_process';
+
+const { mockSpawn } = vi.hoisted(() => ({
+  mockSpawn: vi.fn(),
+}));
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawn: mockSpawn };
+});
+
+import { spawnCli, BackendError, SpawnCliError, SpawnCliTimeoutError } from '../../src/backends/index.js';
+
+function fakeChild(exitCode = 0, stdout = '', stderr = '') {
+  const child = new EventEmitter() as ChildProcess;
+  const out = new PassThrough();
+  const err = new PassThrough();
+  (child as any).stdout = out;
+  (child as any).stderr = err;
+  (child as any).killed = false;
+  (child as any).kill = vi.fn(() => {
+    (child as any).killed = true;
+  });
+  process.nextTick(() => {
+    if (stdout) out.write(stdout);
+    out.end();
+    if (stderr) err.write(stderr);
+    err.end();
+    child.emit('close', exitCode, null);
+  });
+  return child;
+}
+
+describe('spawnCli()', () => {
+  beforeEach(() => {
+    mockSpawn.mockReset();
+  });
+
+  it('resolves with stdout on exit code 0', async () => {
+    mockSpawn.mockReturnValue(fakeChild(0, 'hello world'));
+    const result = await spawnCli('echo', ['hello'], { timeoutMs: 5000 });
+    expect(result.stdout).toBe('hello world');
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('resolves with empty stdout when process produces no output', async () => {
+    mockSpawn.mockReturnValue(fakeChild(0, ''));
+    const result = await spawnCli('quiet', [], { timeoutMs: 5000 });
+    expect(result.stdout).toBe('');
+  });
+
+  it('captures stderr alongside stdout', async () => {
+    mockSpawn.mockReturnValue(fakeChild(0, 'out', 'warn'));
+    const result = await spawnCli('cmd', [], { timeoutMs: 5000 });
+    expect(result.stdout).toBe('out');
+    expect(result.stderr).toBe('warn');
+  });
+
+  it('rejects with SpawnCliError on non-zero exit code and preserves stdout/stderr', async () => {
+    mockSpawn.mockReturnValue(fakeChild(1, '', 'bad input'));
+    const err = await spawnCli('bad', [], { timeoutMs: 5000 }).catch((e) => e);
+    expect(err).toBeInstanceOf(SpawnCliError);
+    expect(err.message).toBe('bad input');
+    expect(err.stdout).toBe('');
+    expect(err.stderr).toBe('bad input');
+    expect(err.exitCode).toBe(1);
+  });
+
+  it('uses stdout as error detail when stderr is empty', async () => {
+    mockSpawn.mockReturnValue(fakeChild(1, 'stdout error', ''));
+    const err = await spawnCli('bad', [], { timeoutMs: 5000 }).catch((e) => e);
+    expect(err).toBeInstanceOf(SpawnCliError);
+    expect(err.message).toBe('stdout error');
+    expect(err.stdout).toBe('stdout error');
+    expect(err.stderr).toBe('');
+  });
+
+  it('rejects on timeout with typed timeout error and descriptive message', async () => {
+    const child = new EventEmitter() as ChildProcess;
+    (child as any).stdout = new PassThrough();
+    (child as any).stderr = new PassThrough();
+    (child as any).killed = false;
+    (child as any).kill = vi.fn(() => {
+      (child as any).killed = true;
+      process.nextTick(() => child.emit('close', null, 'SIGTERM'));
+    });
+    mockSpawn.mockReturnValue(child);
+
+    const err = await spawnCli('slow', [], { timeoutMs: 10, label: 'slow-cmd' }).catch((e) => e);
+
+    expect(err).toBeInstanceOf(SpawnCliTimeoutError);
+    expect(err).toBeInstanceOf(BackendError);
+    expect(err.message).toMatch(/slow-cmd timed out/);
+    expect(err.timeoutMs).toBe(10);
+  });
+
+  describe('a child that ignores SIGTERM', () => {
+    function stubbornChild() {
+      const child = new EventEmitter() as ChildProcess;
+      (child as any).stdout = new PassThrough();
+      (child as any).stderr = new PassThrough();
+      (child as any).kill = vi.fn((signal?: string) => {
+        if (signal === 'SIGKILL') process.nextTick(() => child.emit('close', null, 'SIGKILL'));
+        return true;
+      });
+      return child;
+    }
+
+    it('is killed after killGraceMs when the caller opts in, and the timeout error is kept', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const child = stubbornChild();
+        mockSpawn.mockReturnValue(child);
+        const settled = spawnCli('stuck', [], { timeoutMs: 1000, killGraceMs: 500, label: 'stuck-cmd' }).catch((e) => e);
+
+        await vi.advanceTimersByTimeAsync(1000);
+        expect((child as any).kill).toHaveBeenCalledWith('SIGTERM');
+        expect((child as any).kill).not.toHaveBeenCalledWith('SIGKILL');
+        await vi.advanceTimersByTimeAsync(500);
+        expect((child as any).kill).toHaveBeenCalledWith('SIGKILL');
+
+        const err = await settled;
+        expect(err).toBeInstanceOf(SpawnCliTimeoutError);
+        expect(err.message).toMatch(/stuck-cmd timed out/);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('is never sent SIGKILL without killGraceMs (unchanged default)', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const child = stubbornChild();
+        mockSpawn.mockReturnValue(child);
+        let settled = false;
+        void spawnCli('stuck', [], { timeoutMs: 1000 }).catch(() => undefined).then(() => { settled = true; });
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect((child as any).kill).toHaveBeenCalledWith('SIGTERM');
+        expect((child as any).kill).not.toHaveBeenCalledWith('SIGKILL');
+        expect(settled).toBe(false);
+        child.emit('close', null, 'SIGTERM');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not send SIGKILL to a child that exits within the grace period', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const child = stubbornChild();
+        mockSpawn.mockReturnValue(child);
+        const settled = spawnCli('slow', [], { timeoutMs: 1000, killGraceMs: 500 }).catch((e) => e);
+        await vi.advanceTimersByTimeAsync(1000);
+        child.emit('close', 143, null);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect((child as any).kill).not.toHaveBeenCalledWith('SIGKILL');
+        expect(await settled).toBeInstanceOf(SpawnCliTimeoutError);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it('rejects on signal kill', async () => {
+    const child = new EventEmitter() as ChildProcess;
+    (child as any).stdout = new PassThrough();
+    (child as any).stderr = new PassThrough();
+    (child as any).killed = false;
+    (child as any).kill = vi.fn();
+    mockSpawn.mockReturnValue(child);
+    process.nextTick(() => child.emit('close', null, 'SIGKILL'));
+
+    await expect(spawnCli('killed', [], { timeoutMs: 5000 }))
+      .rejects.toThrow(/SIGKILL/);
+  });
+
+  it('passes env and cwd to spawn', async () => {
+    mockSpawn.mockReturnValue(fakeChild(0, 'ok'));
+    await spawnCli('cmd', ['a'], {
+      timeoutMs: 5000,
+      env: { FOO: '1', PATH: '/usr/bin' },
+      cwd: '/tmp',
+    });
+    expect(mockSpawn).toHaveBeenCalledWith('cmd', ['a'], expect.objectContaining({
+      env: { FOO: '1', PATH: '/usr/bin' },
+      cwd: '/tmp',
+    }));
+  });
+
+  it('defaults env to process.env when not provided', async () => {
+    mockSpawn.mockReturnValue(fakeChild(0, 'ok'));
+    await spawnCli('cmd', [], { timeoutMs: 5000 });
+    expect(mockSpawn).toHaveBeenCalledWith('cmd', [], expect.objectContaining({
+      env: process.env,
+    }));
+  });
+
+  it('uses command name as default label in error messages', async () => {
+    mockSpawn.mockReturnValue(fakeChild(1, '', ''));
+    await expect(spawnCli('mybin', [], { timeoutMs: 5000 }))
+      .rejects.toThrow(/mybin exited with code 1/);
+  });
+
+  it('spawns with stdio ignore/pipe/pipe', async () => {
+    mockSpawn.mockReturnValue(fakeChild(0, 'ok'));
+    await spawnCli('cmd', [], { timeoutMs: 5000 });
+    expect(mockSpawn).toHaveBeenCalledWith('cmd', [], expect.objectContaining({
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }));
+  });
+
+  it('rejects with BackendError when spawn emits error (e.g. ENOENT)', async () => {
+    const child = new EventEmitter() as ChildProcess;
+    (child as any).stdout = new PassThrough();
+    (child as any).stderr = new PassThrough();
+    (child as any).killed = false;
+    (child as any).kill = vi.fn();
+    mockSpawn.mockReturnValue(child);
+    process.nextTick(() => child.emit('error', new Error('spawn ENOENT')));
+
+    const err = await spawnCli('missing', [], { timeoutMs: 5000 }).catch((e) => e);
+    expect(err).toBeInstanceOf(BackendError);
+    expect(err.message).toContain('failed to start');
+    expect(err.message).toContain('ENOENT');
+  });
+});
+
+describe('spawnCli() stdout tap', () => {
+  beforeEach(() => {
+    mockSpawn.mockReset();
+  });
+
+  it('delivers stdout chunks to onStdout as they arrive and still returns the full stdout', async () => {
+    const child = new EventEmitter() as ChildProcess;
+    const out = new PassThrough();
+    (child as any).stdout = out;
+    (child as any).stderr = new PassThrough();
+    (child as any).killed = false;
+    (child as any).kill = vi.fn();
+    mockSpawn.mockReturnValue(child);
+
+    const seen: string[] = [];
+    const promise = spawnCli('cmd', [], {
+      timeoutMs: 5000,
+      onStdout: (chunk) => seen.push(chunk),
+    });
+
+    out.write('{"type":"thread.started"}\n');
+    await new Promise((r) => setImmediate(r));
+    expect(seen).toEqual(['{"type":"thread.started"}\n']);
+
+    out.write('{"type":"turn.completed"}\n');
+    out.end();
+    child.emit('close', 0, null);
+
+    const result = await promise;
+    expect(seen).toHaveLength(2);
+    expect(result.stdout).toBe('{"type":"thread.started"}\n{"type":"turn.completed"}');
+  });
+
+  it('keeps stdout delivery going even when onStdout throws', async () => {
+    mockSpawn.mockReturnValue(fakeChild(0, 'first\nsecond'));
+    const result = await spawnCli('cmd', [], {
+      timeoutMs: 5000,
+      onStdout: () => { throw new Error('observer bug'); },
+    });
+    expect(result.stdout).toBe('first\nsecond');
+  });
+});
