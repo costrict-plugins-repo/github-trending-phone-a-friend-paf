@@ -1,0 +1,2552 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+// Mock child_process for claude CLI calls
+const { mockExecFileSync } = vi.hoisted(() => ({
+  mockExecFileSync: vi.fn(),
+}));
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, execFileSync: mockExecFileSync };
+});
+
+import {
+  installHosts,
+  uninstallHosts,
+  verifyBackends,
+  isOpenCodeInstalled,
+  isCodexInstalled,
+  isPluginInstalled,
+  installFromGitHubMarketplace,
+  getMarketplaceSourceType,
+  claudeConfigRoot,
+  claudeTarget,
+  claudeMarketplaceSource,
+  claudeMarketplaceStatus,
+  opencodeCommandTarget,
+  opencodeSkillTarget,
+  codexConfigRoot,
+  codexSkillTarget,
+  codexMarketplaceSource,
+  isPiInstalled,
+  isGrokInstalled,
+  piAgentDir,
+  piSkillTarget,
+  grokConfigRoot,
+  grokSkillTarget,
+  InstallerError,
+  PLUGIN_NAME,
+  MARKETPLACE_NAME,
+  GITHUB_REPO,
+} from '../src/installer.js';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeTempDir(prefix: string): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function makeRepo(prefix = 'phone-a-friend-repo-'): string {
+  const repo = makeTempDir(prefix);
+  const pluginDir = path.join(repo, '.claude-plugin');
+  fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginDir, 'plugin.json'),
+      '{"name":"phone-a-friend"}',
+    );
+  const commandsDir = path.join(repo, 'commands');
+  fs.mkdirSync(commandsDir, { recursive: true });
+  // OpenCode skills (active set after option C — phone-a-team was dropped)
+  for (const name of ['phone-a-friend', 'curiosity-engine']) {
+    const skillDir = path.join(repo, 'skills', name);
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      `---\nname: ${name}\ndescription: test skill\n---\n`,
+    );
+    fs.writeFileSync(
+      path.join(commandsDir, `${name}.md`),
+      '---\ndescription: test command\n---\n',
+    );
+  }
+  // phone-a-team has a Claude command file at commands/phone-a-team.md and
+  // a Codex-only overlay at skills/phone-a-team/.codex/SKILL.md (no
+  // host-neutral SKILL.md, so OpenCode does not install it).
+  fs.writeFileSync(
+    path.join(commandsDir, 'phone-a-team.md'),
+    '---\nname: phone-a-team\ndescription: test claude command\n---\n',
+  );
+  const phoneATeamCodexDir = path.join(repo, 'skills', 'phone-a-team', '.codex');
+  fs.mkdirSync(phoneATeamCodexDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(phoneATeamCodexDir, 'SKILL.md'),
+    '---\nname: phone-a-team\ndescription: test codex overlay\n---\n',
+  );
+  const phoneATeamGrokDir = path.join(repo, 'skills', 'phone-a-team', '.grok');
+  fs.mkdirSync(phoneATeamGrokDir, { recursive: true });
+  fs.writeFileSync(path.join(phoneATeamGrokDir, 'SKILL.md'),
+    '---\nname: phone-a-team\ndescription: test grok overlay\n---\n');
+  // Codex subagent personas (Codex installer reads agents/codex/paf-*.toml).
+  const codexAgentsDir = path.join(repo, 'agents', 'codex');
+  fs.mkdirSync(codexAgentsDir, { recursive: true });
+  for (const name of ['paf-reviewer', 'paf-critic', 'paf-synthesizer']) {
+    fs.writeFileSync(
+      path.join(codexAgentsDir, `${name}.toml`),
+      `name = "${name}"\ndescription = "test ${name}"\ndeveloper_instructions = "test instructions"\n`,
+    );
+  }
+  return repo;
+}
+
+function makeHome(): string {
+  return makeTempDir('phone-a-friend-home-');
+}
+
+// Keep every test away from the real Claude and PaF config: functions called
+// without an explicit home fall back to CLAUDE_CONFIG_DIR and XDG_CONFIG_HOME.
+let isolatedEnvRoot: string;
+beforeEach(() => {
+  isolatedEnvRoot = makeTempDir('paf-installer-env-');
+  vi.stubEnv('CLAUDE_CONFIG_DIR', path.join(isolatedEnvRoot, 'claude'));
+  vi.stubEnv('XDG_CONFIG_HOME', path.join(isolatedEnvRoot, 'xdg'));
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  fs.rmSync(isolatedEnvRoot, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('installer constants', () => {
+  it('exports expected constants', () => {
+    expect(PLUGIN_NAME).toBe('phone-a-friend');
+    expect(MARKETPLACE_NAME).toBe('phone-a-friend-marketplace');
+  });
+});
+
+  describe('installHosts', () => {
+    let repo: string;
+    let claudeHome: string;
+    let opencodeHome: string;
+
+    beforeEach(() => {
+      mockExecFileSync.mockReset();
+      repo = makeRepo();
+      claudeHome = makeHome();
+      opencodeHome = makeHome();
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      try { fs.rmSync(repo, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(claudeHome, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(opencodeHome, { recursive: true, force: true }); } catch {}
+    });
+
+  it('installs via symlink', () => {
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: false,
+      claudeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    const target = path.join(claudeHome, 'plugins', 'phone-a-friend');
+    const stat = fs.lstatSync(target);
+    expect(stat.isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(target)).toBe(fs.realpathSync(repo));
+    expect(lines.some(l => l.includes('installed'))).toBe(true);
+  });
+
+  it('installs via copy', () => {
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'copy',
+      force: false,
+      claudeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    const target = path.join(claudeHome, 'plugins', 'phone-a-friend');
+    const stat = fs.lstatSync(target);
+    expect(stat.isDirectory()).toBe(true);
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(
+      fs.existsSync(path.join(target, '.claude-plugin', 'plugin.json')),
+    ).toBe(true);
+    expect(lines.some(l => l.includes('installed'))).toBe(true);
+  });
+
+    it('detects already-installed symlink', () => {
+    // First install
+    installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: false,
+      claudeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    // Second install — same symlink target
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: false,
+      claudeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+      expect(lines.some(l => l.includes('already-installed'))).toBe(true);
+    });
+
+    it('installs OpenCode skill and command shims', () => {
+      const lines = installHosts({
+        repoRoot: repo,
+        target: 'opencode',
+        mode: 'symlink',
+        force: false,
+        opencodeHome,
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      });
+
+      const skillTarget = opencodeSkillTarget('phone-a-friend', opencodeHome);
+      const commandTarget = opencodeCommandTarget('phone-a-friend', opencodeHome);
+
+      expect(fs.lstatSync(skillTarget).isSymbolicLink()).toBe(true);
+      expect(fs.realpathSync(skillTarget)).toBe(fs.realpathSync(path.join(repo, 'skills', 'phone-a-friend')));
+      expect(fs.lstatSync(commandTarget).isSymbolicLink()).toBe(true);
+      expect(fs.realpathSync(commandTarget)).toBe(fs.realpathSync(path.join(repo, 'commands', 'phone-a-friend.md')));
+      expect(lines.some(l => l.includes('opencode_skill:phone-a-friend'))).toBe(true);
+      expect(lines.some(l => l.includes('opencode_command:phone-a-friend'))).toBe(true);
+      expect(lines.some(l => l.includes('opencode_skill:curiosity-engine'))).toBe(true);
+      expect(lines.some(l => l.includes('opencode_command:curiosity-engine'))).toBe(true);
+      // phone-a-team is Claude-only; must NOT be installed for OpenCode.
+      expect(lines.some(l => l.includes('opencode_skill:phone-a-team') && !l.includes('removed'))).toBe(false);
+      expect(fs.existsSync(opencodeSkillTarget('phone-a-team', opencodeHome))).toBe(false);
+      expect(fs.existsSync(opencodeCommandTarget('phone-a-team', opencodeHome))).toBe(false);
+      expect(lines.some(l => l.includes('claude:'))).toBe(false);
+    });
+
+    it('uses skills/<name>/COMMAND.opencode.md as the OpenCode command source when present', () => {
+      // Add per-skill overlay for phone-a-friend (any active OpenCode skill works).
+      const overlayPath = path.join(repo, 'skills', 'phone-a-friend', 'COMMAND.opencode.md');
+      fs.writeFileSync(overlayPath, '---\ndescription: opencode overlay\n---\nuse the skill\n');
+
+      installHosts({
+        repoRoot: repo,
+        target: 'opencode',
+        mode: 'symlink',
+        force: false,
+        opencodeHome,
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      });
+
+      const phoneAFriendCmd = opencodeCommandTarget('phone-a-friend', opencodeHome);
+      const curiosityCmd = opencodeCommandTarget('curiosity-engine', opencodeHome);
+
+      // phone-a-friend uses the overlay
+      expect(fs.realpathSync(phoneAFriendCmd)).toBe(fs.realpathSync(overlayPath));
+      // curiosity-engine (no overlay) still uses commands/<name>.md
+      expect(fs.realpathSync(curiosityCmd)).toBe(
+        fs.realpathSync(path.join(repo, 'commands', 'curiosity-engine.md')),
+      );
+    });
+
+    it('migrates a stale OpenCode command symlink that points into the same repo', () => {
+      // Simulate prior install: command symlink → commands/phone-a-friend.md
+      installHosts({
+        repoRoot: repo,
+        target: 'opencode',
+        mode: 'symlink',
+        force: false,
+        opencodeHome,
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      });
+      const cmdTarget = opencodeCommandTarget('phone-a-friend', opencodeHome);
+      expect(fs.realpathSync(cmdTarget)).toBe(
+        fs.realpathSync(path.join(repo, 'commands', 'phone-a-friend.md')),
+      );
+
+      // Now add an overlay and reinstall WITHOUT --force; the existing symlink
+      // points inside the repo (PaF-owned) so it should be auto-replaced.
+      const overlayPath = path.join(repo, 'skills', 'phone-a-friend', 'COMMAND.opencode.md');
+      fs.writeFileSync(overlayPath, '---\ndescription: opencode overlay\n---\nuse the skill\n');
+
+      installHosts({
+        repoRoot: repo,
+        target: 'opencode',
+        mode: 'symlink',
+        force: false,
+        opencodeHome,
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      });
+
+      expect(fs.realpathSync(cmdTarget)).toBe(fs.realpathSync(overlayPath));
+    });
+
+    it('does not auto-replace a symlink that points outside the repo', () => {
+      // Pre-create an unrelated file outside the repo and symlink the
+      // OpenCode command target at it. The installer should refuse to
+      // overwrite without force, since this was not PaF-managed.
+      const foreign = makeTempDir('paf-foreign-');
+      const foreignFile = path.join(foreign, 'phone-a-friend.md');
+      fs.writeFileSync(foreignFile, 'not ours\n');
+
+      const cmdTarget = opencodeCommandTarget('phone-a-friend', opencodeHome);
+      fs.mkdirSync(path.dirname(cmdTarget), { recursive: true });
+      fs.symlinkSync(foreignFile, cmdTarget);
+
+      try {
+        expect(() =>
+          installHosts({
+            repoRoot: repo,
+            target: 'opencode',
+            mode: 'symlink',
+            force: false,
+            opencodeHome,
+            syncClaudeCli: false,
+      syncCodexCli: false,
+          }),
+        ).toThrow(/already exists/);
+      } finally {
+        try { fs.rmSync(foreign, { recursive: true, force: true }); } catch {}
+      }
+    });
+
+    it('removes legacy phone-a-team symlinks from prior OpenCode installs (PaF-owned)', () => {
+      // Simulate a user whose previous PaF install symlinked phone-a-team
+      // into ~/.config/opencode/. After option C those source files no longer
+      // exist in the repo, leaving broken symlinks. The cleanup pass should
+      // remove them.
+      const legacySkillDir = opencodeSkillTarget('phone-a-team', opencodeHome);
+      const legacyCmd = opencodeCommandTarget('phone-a-team', opencodeHome);
+      // Source files we'll point at, then delete to simulate the post-option-C
+      // state where the symlinks are broken.
+      const fakeSkillSource = path.join(repo, 'skills', 'phone-a-team');
+      const fakeCmdSource = path.join(repo, 'commands', 'phone-a-team-legacy.md');
+      fs.mkdirSync(fakeSkillSource, { recursive: true });
+      fs.writeFileSync(path.join(fakeSkillSource, 'SKILL.md'), 'legacy');
+      fs.writeFileSync(fakeCmdSource, 'legacy');
+      // Create the user's existing PaF-owned symlinks.
+      fs.mkdirSync(path.dirname(legacySkillDir), { recursive: true });
+      fs.symlinkSync(fakeSkillSource, legacySkillDir);
+      fs.mkdirSync(path.dirname(legacyCmd), { recursive: true });
+      fs.symlinkSync(fakeCmdSource, legacyCmd);
+      // Now delete the source files to simulate the broken-symlink case.
+      fs.rmSync(fakeSkillSource, { recursive: true, force: true });
+      fs.rmSync(fakeCmdSource, { force: true });
+
+      const lines = installHosts({
+        repoRoot: repo,
+        target: 'opencode',
+        mode: 'symlink',
+        force: false,
+        opencodeHome,
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      });
+
+      // Symlinks themselves should be gone (even though their targets were
+      // already deleted — fs.lstat on a removed symlink throws ENOENT).
+      expect(() => fs.lstatSync(legacySkillDir)).toThrow();
+      expect(() => fs.lstatSync(legacyCmd)).toThrow();
+      expect(lines.some(l => l.includes('opencode_skill:phone-a-team') && l.includes('removed'))).toBe(true);
+      expect(lines.some(l => l.includes('opencode_command:phone-a-team') && l.includes('removed'))).toBe(true);
+    });
+
+    it('preserves user-authored phone-a-team files (not PaF-owned)', () => {
+      // A user might manually author their own phone-a-team skill for OpenCode
+      // (e.g. a homemade portable team workflow). PaF must not silently delete
+      // their work during the legacy cleanup pass.
+      const userSkillDir = opencodeSkillTarget('phone-a-team', opencodeHome);
+      const userCmd = opencodeCommandTarget('phone-a-team', opencodeHome);
+      fs.mkdirSync(userSkillDir, { recursive: true });
+      fs.writeFileSync(path.join(userSkillDir, 'SKILL.md'), '---\nname: phone-a-team\ndescription: my own version\n---\n');
+      fs.mkdirSync(path.dirname(userCmd), { recursive: true });
+      fs.writeFileSync(userCmd, '---\ndescription: my own version\n---\n');
+
+      const lines = installHosts({
+        repoRoot: repo,
+        target: 'opencode',
+        mode: 'symlink',
+        force: false,
+        opencodeHome,
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      });
+
+      // Files survive untouched.
+      expect(fs.existsSync(userSkillDir)).toBe(true);
+      expect(fs.existsSync(userCmd)).toBe(true);
+      // Cleanup logs a "kept" line so users see what happened.
+      expect(lines.some(l => l.includes('opencode_skill:phone-a-team') && l.includes('kept'))).toBe(true);
+      expect(lines.some(l => l.includes('opencode_command:phone-a-team') && l.includes('kept'))).toBe(true);
+    });
+
+  it('raises when destination exists and force is false', () => {
+    // Install once
+    installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'copy',
+      force: false,
+      claudeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    // Second install with different mode — should fail without force
+    expect(() =>
+      installHosts({
+        repoRoot: repo,
+        target: 'claude',
+        mode: 'symlink',
+        force: false,
+        claudeHome,
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      }),
+    ).toThrow(/already exists/);
+  });
+
+  it('recovers from broken (dangling) symlink with force', () => {
+    const pluginDir = path.join(claudeHome, 'plugins');
+    fs.mkdirSync(pluginDir, { recursive: true });
+    const target = path.join(pluginDir, 'phone-a-friend');
+
+    // Create a dangling symlink pointing to a non-existent path
+    fs.symlinkSync('/tmp/nonexistent-paf-target', target);
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+
+    // Force install should recover
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: true,
+      claudeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(target)).toBe(fs.realpathSync(repo));
+    expect(lines.some(l => l.includes('installed'))).toBe(true);
+  });
+
+  it('replaces when force is true', () => {
+    // Install via copy first
+    installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'copy',
+      force: false,
+      claudeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    // Force re-install via symlink
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: true,
+      claudeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    const target = path.join(claudeHome, 'plugins', 'phone-a-friend');
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+    expect(lines.some(l => l.includes('installed'))).toBe(true);
+  });
+
+  it('raises on invalid repo root (no plugin.json)', () => {
+    const invalidRepo = makeTempDir('phone-a-friend-invalid-');
+
+    expect(() =>
+      installHosts({
+        repoRoot: invalidRepo,
+        target: 'claude',
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      }),
+    ).toThrow(/Invalid repo root/);
+
+    fs.rmSync(invalidRepo, { recursive: true, force: true });
+  });
+
+  it('raises on invalid target', () => {
+    expect(() =>
+      installHosts({
+        repoRoot: repo,
+        target: 'invalid' as 'claude',
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      }),
+    ).toThrow(/Invalid target/);
+  });
+
+  it('raises on invalid mode', () => {
+    expect(() =>
+      installHosts({
+        repoRoot: repo,
+        target: 'claude',
+        mode: 'invalid' as 'symlink',
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      }),
+    ).toThrow(/Invalid mode/);
+  });
+
+  it('syncs Claude CLI registration when syncClaudeCli is true', () => {
+    // Mock `which` to find claude, then mock the 5 registration commands
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      // All claude plugin commands succeed
+      return '';
+    });
+
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: false,
+      claudeHome,
+      syncClaudeCli: true,
+    });
+
+    // Should have called claude plugin commands:
+    // 3 legacy cleanup (disable, uninstall, marketplace remove) + 5 registration (marketplace add, update, install, enable, update)
+    const claudeCalls = mockExecFileSync.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'claude',
+    );
+    expect(claudeCalls.length).toBe(8);
+    expect(lines.some(l => l.includes('marketplace_add: ok'))).toBe(true);
+  });
+
+  it('skips CLI sync when claude binary not found', () => {
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') throw new Error('not found');
+      return '';
+    });
+
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: false,
+      claudeHome,
+      syncClaudeCli: true,
+    });
+
+    expect(lines.some(l => l.includes('skipped'))).toBe(true);
+    expect(lines.some(l => l.includes('claude binary not found'))).toBe(true);
+  });
+});
+
+describe('uninstallHosts', () => {
+  let repo: string;
+  let claudeHome: string;
+
+  beforeEach(() => {
+    mockExecFileSync.mockReset();
+    repo = makeRepo();
+    claudeHome = makeHome();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    try { fs.rmSync(repo, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(claudeHome, { recursive: true, force: true }); } catch {}
+  });
+
+  it('removes installed symlink', () => {
+    installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: false,
+      claudeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    const lines = uninstallHosts({ target: 'claude', claudeHome });
+    const target = path.join(claudeHome, 'plugins', 'phone-a-friend');
+    expect(fs.existsSync(target)).toBe(false);
+    expect(lines.some(l => l.includes('removed'))).toBe(true);
+  });
+
+  it('reports not-installed when nothing to remove', () => {
+    const lines = uninstallHosts({ target: 'claude', claudeHome });
+    expect(lines.some(l => l.includes('not-installed'))).toBe(true);
+  });
+
+  it('preserves user-authored phone-a-team files on uninstall --opencode', () => {
+    // Same safety property as the install-time legacy cleanup: a user who
+    // hand-authored their own phone-a-team skill must not lose it when they
+    // run `phone-a-friend plugin uninstall --opencode`.
+    const opencodeHome = makeHome();
+    try {
+      const userSkillDir = opencodeSkillTarget('phone-a-team', opencodeHome);
+      const userCmd = opencodeCommandTarget('phone-a-team', opencodeHome);
+      fs.mkdirSync(userSkillDir, { recursive: true });
+      fs.writeFileSync(path.join(userSkillDir, 'SKILL.md'), '---\nname: phone-a-team\ndescription: my own version\n---\n');
+      fs.mkdirSync(path.dirname(userCmd), { recursive: true });
+      fs.writeFileSync(userCmd, '---\ndescription: my own version\n---\n');
+
+      const lines = uninstallHosts({
+        target: 'opencode',
+        opencodeHome,
+        repoRoot: repo,
+      });
+
+      expect(fs.existsSync(userSkillDir)).toBe(true);
+      expect(fs.existsSync(userCmd)).toBe(true);
+      expect(lines.some(l => l.includes('opencode_skill:phone-a-team') && l.includes('kept'))).toBe(true);
+      expect(lines.some(l => l.includes('opencode_command:phone-a-team') && l.includes('kept'))).toBe(true);
+    } finally {
+      try { fs.rmSync(opencodeHome, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('removes PaF-owned legacy phone-a-team symlinks on uninstall --opencode', () => {
+    const opencodeHome = makeHome();
+    try {
+      const legacySkillDir = opencodeSkillTarget('phone-a-team', opencodeHome);
+      const legacyCmd = opencodeCommandTarget('phone-a-team', opencodeHome);
+      // Source files inside the test repo, then deleted to simulate the
+      // post-option-C broken-symlink state.
+      const fakeSkillSource = path.join(repo, 'skills', 'phone-a-team');
+      const fakeCmdSource = path.join(repo, 'commands', 'phone-a-team-uninstall.md');
+      fs.mkdirSync(fakeSkillSource, { recursive: true });
+      fs.writeFileSync(path.join(fakeSkillSource, 'SKILL.md'), 'legacy');
+      fs.writeFileSync(fakeCmdSource, 'legacy');
+      fs.mkdirSync(path.dirname(legacySkillDir), { recursive: true });
+      fs.symlinkSync(fakeSkillSource, legacySkillDir);
+      fs.mkdirSync(path.dirname(legacyCmd), { recursive: true });
+      fs.symlinkSync(fakeCmdSource, legacyCmd);
+      fs.rmSync(fakeSkillSource, { recursive: true, force: true });
+      fs.rmSync(fakeCmdSource, { force: true });
+
+      const lines = uninstallHosts({
+        target: 'opencode',
+        opencodeHome,
+        repoRoot: repo,
+      });
+
+      expect(() => fs.lstatSync(legacySkillDir)).toThrow();
+      expect(() => fs.lstatSync(legacyCmd)).toThrow();
+      expect(lines.some(l => l.includes('opencode_skill:phone-a-team') && l.includes('removed'))).toBe(true);
+      expect(lines.some(l => l.includes('opencode_command:phone-a-team') && l.includes('removed'))).toBe(true);
+    } finally {
+      try { fs.rmSync(opencodeHome, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('raises on invalid target', () => {
+    expect(() =>
+      uninstallHosts({ target: 'invalid' as 'claude' }),
+    ).toThrow(/Invalid target/);
+  });
+
+  it('removes marketplace registration on uninstall', () => {
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = uninstallHosts({ target: 'claude', claudeHome });
+
+    const claudeCalls = mockExecFileSync.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'claude',
+    );
+    // Should call: disable, uninstall, marketplace remove (+ legacy variants)
+    const marketplaceRemoveCalls = claudeCalls.filter(
+      (c: unknown[]) => (c[1] as string[]).includes('marketplace') && (c[1] as string[]).includes('remove'),
+    );
+    expect(marketplaceRemoveCalls.length).toBeGreaterThanOrEqual(1);
+    expect(lines.some(l => l.includes('marketplace_remove'))).toBe(true);
+  });
+
+  it('uninstalls the paf-tasks review panel before removing its marketplace', () => {
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = uninstallHosts({ target: 'claude', claudeHome });
+
+    const args = mockExecFileSync.mock.calls.filter((c: unknown[]) => c[0] === 'claude').map((c: unknown[]) => (c[1] as string[]).join(' '));
+    const mod = args.indexOf('plugin uninstall paf-tasks@phone-a-friend-marketplace -s user');
+    expect(mod).toBeGreaterThanOrEqual(0);
+    expect(mod).toBeLessThan(args.indexOf('plugin marketplace remove phone-a-friend-marketplace'));
+    expect(lines).toContain('- claude_cli_mod_uninstall: ok');
+  });
+
+  it('with --purge-marketplace, uninstalls the panel even from a marketplace the user registered', () => {
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    uninstallHosts({ target: 'claude', claudeHome, claudeCliUnsync: 'always' });
+
+    const args = mockExecFileSync.mock.calls.filter((c: unknown[]) => c[0] === 'claude').map((c: unknown[]) => (c[1] as string[]).join(' '));
+    expect(args).toContain('plugin uninstall paf-tasks@phone-a-friend-marketplace -s user');
+  });
+
+  it('does not report the panel when it was never installed', () => {
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      if (args.includes('paf-tasks@phone-a-friend-marketplace')) {
+        throw Object.assign(new Error('not installed'), { status: 1, stdout: '', stderr: 'Plugin "paf-tasks" is not installed' });
+      }
+      return '';
+    });
+
+    const lines = uninstallHosts({ target: 'claude', claudeHome });
+
+    expect(lines.some(l => l.includes('mod_uninstall'))).toBe(false);
+    expect(lines.some(l => l.includes('claude_cli_marketplace_remove: ok'))).toBe(true);
+  });
+});
+
+describe('verifyBackends', () => {
+  beforeEach(() => {
+    mockExecFileSync.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('returns availability map with hints', () => {
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'which' && args[0] === 'agy') return '/usr/bin/agy';
+      if (cmd === 'which' && args[0] === 'codex') return '/usr/bin/codex';
+      throw new Error('not found');
+    });
+
+    const results = verifyBackends();
+    const byName = Object.fromEntries(results.map(r => [r.name, r]));
+
+    expect(byName['antigravity'].available).toBe(true);
+    expect(byName['antigravity'].hint).toContain('antigravity.google');
+    expect(byName['codex'].available).toBe(true);
+    expect(byName['gemini'].available).toBe(false);
+    expect(byName['gemini'].hint).toContain('npm');
+  });
+});
+
+describe('isPluginInstalled (marketplace cache)', () => {
+  it('returns true when plugin exists in marketplace cache', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-test-'));
+    const cacheDir = path.join(tmpHome, 'plugins', 'cache', MARKETPLACE_NAME, PLUGIN_NAME);
+    fs.mkdirSync(cacheDir, { recursive: true });
+    expect(isPluginInstalled(tmpHome)).toBe(true);
+    fs.rmSync(tmpHome, { recursive: true });
+  });
+
+  it('returns false when neither local nor cache install exists', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-test-'));
+    fs.mkdirSync(path.join(tmpHome, 'plugins'), { recursive: true });
+    expect(isPluginInstalled(tmpHome)).toBe(false);
+    fs.rmSync(tmpHome, { recursive: true });
+  });
+
+  it('returns true when local symlink exists (existing behavior)', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-test-'));
+    const repo = makeRepo();
+    const pluginPath = path.join(tmpHome, 'plugins', PLUGIN_NAME);
+    fs.mkdirSync(path.join(tmpHome, 'plugins'), { recursive: true });
+    fs.symlinkSync(repo, pluginPath);
+    expect(isPluginInstalled(tmpHome)).toBe(true);
+    fs.rmSync(tmpHome, { recursive: true });
+    fs.rmSync(repo, { recursive: true });
+  });
+});
+
+describe('isOpenCodeInstalled', () => {
+  it('returns true when all OpenCode skills and command shims exist', () => {
+    const repo = makeRepo();
+    const opencodeHome = makeHome();
+    installHosts({
+      repoRoot: repo,
+      target: 'opencode',
+      mode: 'symlink',
+      force: false,
+      opencodeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    expect(isOpenCodeInstalled(opencodeHome)).toBe(true);
+
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(opencodeHome, { recursive: true, force: true });
+  });
+
+  it('returns false when any OpenCode command shim is missing', () => {
+    const repo = makeRepo();
+    const opencodeHome = makeHome();
+    installHosts({
+      repoRoot: repo,
+      target: 'opencode',
+      mode: 'symlink',
+      force: false,
+      opencodeHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    fs.rmSync(opencodeCommandTarget('phone-a-friend', opencodeHome), { force: true });
+    expect(isOpenCodeInstalled(opencodeHome)).toBe(false);
+
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(opencodeHome, { recursive: true, force: true });
+  });
+});
+
+describe('Codex host integration', () => {
+  let repo: string;
+  let codexHome: string;
+
+  beforeEach(() => {
+    mockExecFileSync.mockReset();
+    repo = makeRepo();
+    codexHome = makeHome();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    try { fs.rmSync(repo, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(codexHome, { recursive: true, force: true }); } catch {}
+  });
+
+  it('installs Codex skills via symlink', () => {
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    const skillTarget = codexSkillTarget('phone-a-friend', codexHome);
+    expect(fs.lstatSync(skillTarget).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(skillTarget)).toBe(
+      fs.realpathSync(path.join(repo, 'skills', 'phone-a-friend')),
+    );
+
+    const curiosityTarget = codexSkillTarget('curiosity-engine', codexHome);
+    expect(fs.lstatSync(curiosityTarget).isSymbolicLink()).toBe(true);
+
+    expect(lines.some(l => l.includes('codex_skill:phone-a-friend'))).toBe(true);
+    expect(lines.some(l => l.includes('codex_skill:curiosity-engine'))).toBe(true);
+    // phone-a-team is installed for Codex via the .codex/ overlay
+    // (Codex-tuned Bash-orchestrated iterative refinement, no subagent spawn).
+    expect(fs.existsSync(codexSkillTarget('phone-a-team', codexHome))).toBe(true);
+    expect(lines.some(l => l.includes('codex_skill:phone-a-team'))).toBe(true);
+    // No claude artifacts created.
+    expect(lines.some(l => l.startsWith('- claude:'))).toBe(false);
+  });
+
+  it('uses skills/<name>/.codex/ as the Codex skill source when present', () => {
+    // Author a Codex-tuned overlay.
+    const overlayDir = path.join(repo, 'skills', 'phone-a-friend', '.codex');
+    fs.mkdirSync(overlayDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(overlayDir, 'SKILL.md'),
+      '---\nname: phone-a-friend\ndescription: codex overlay\n---\n',
+    );
+
+    installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    const skillTarget = codexSkillTarget('phone-a-friend', codexHome);
+    expect(fs.realpathSync(skillTarget)).toBe(fs.realpathSync(overlayDir));
+
+    // curiosity-engine (no overlay) still uses skills/<name>/.
+    const curiosityTarget = codexSkillTarget('curiosity-engine', codexHome);
+    expect(fs.realpathSync(curiosityTarget)).toBe(
+      fs.realpathSync(path.join(repo, 'skills', 'curiosity-engine')),
+    );
+  });
+
+  it('installs via copy', () => {
+    installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'copy',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    const skillTarget = codexSkillTarget('phone-a-friend', codexHome);
+    const stat = fs.lstatSync(skillTarget);
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(stat.isDirectory()).toBe(true);
+    expect(fs.existsSync(path.join(skillTarget, 'SKILL.md'))).toBe(true);
+  });
+
+  it('does not install Codex skills when target=claude', () => {
+    installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: false,
+      claudeHome: makeHome(),
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    expect(fs.existsSync(codexSkillTarget('phone-a-friend', codexHome))).toBe(false);
+  });
+
+  it('target=all installs every host', () => {
+    const claudeHome = makeHome();
+    const opencodeHome = makeHome();
+    const piHome = makeHome();
+    const grokHome = makeHome();
+    try {
+      const lines = installHosts({
+        repoRoot: repo,
+        target: 'all',
+        mode: 'symlink',
+        force: false,
+        claudeHome,
+        opencodeHome,
+        codexHome,
+        piHome,
+        grokHome,
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      });
+
+      expect(fs.existsSync(path.join(claudeHome, 'plugins', 'phone-a-friend'))).toBe(true);
+      expect(fs.existsSync(opencodeSkillTarget('phone-a-friend', opencodeHome))).toBe(true);
+      expect(fs.existsSync(codexSkillTarget('phone-a-friend', codexHome))).toBe(true);
+      expect(fs.existsSync(piSkillTarget('phone-a-friend', piHome))).toBe(true);
+      expect(fs.existsSync(grokSkillTarget('phone-a-friend', grokHome))).toBe(true);
+      expect(lines.some(l => l.includes('codex_skill:phone-a-friend'))).toBe(true);
+      expect(lines.some(l => l.includes('pi_skill:phone-a-friend'))).toBe(true);
+      expect(lines.some(l => l.includes('grok_skill:phone-a-friend'))).toBe(true);
+    } finally {
+      try { fs.rmSync(claudeHome, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(opencodeHome, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(piHome, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(grokHome, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('uninstall removes Codex skills', () => {
+    installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+    expect(fs.existsSync(codexSkillTarget('phone-a-friend', codexHome))).toBe(true);
+
+    const lines = uninstallHosts({
+      target: 'codex',
+      codexHome,
+      repoRoot: repo,
+    });
+
+    expect(fs.existsSync(codexSkillTarget('phone-a-friend', codexHome))).toBe(false);
+    expect(fs.existsSync(codexSkillTarget('curiosity-engine', codexHome))).toBe(false);
+    expect(lines.some(l => l.includes('codex_skill:phone-a-friend') && l.includes('removed'))).toBe(true);
+  });
+
+  it('isCodexInstalled reflects skill presence', () => {
+    expect(isCodexInstalled(codexHome)).toBe(false);
+
+    installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+    expect(isCodexInstalled(codexHome)).toBe(true);
+
+    fs.rmSync(codexSkillTarget('phone-a-friend', codexHome), { recursive: true, force: true });
+    expect(isCodexInstalled(codexHome)).toBe(false);
+  });
+
+  it('isCodexInstalled detects marketplace-only installs in the plugin cache', () => {
+    // Simulate `codex plugin marketplace add` + `codex plugin add` having
+    // populated the cache without anything in $CODEX_HOME/skills/. PaF's
+    // doctor/TUI must still report installed because the skills ARE
+    // callable inside Codex.
+    expect(isCodexInstalled(codexHome)).toBe(false);
+
+    const cacheRoot = path.join(
+      codexHome,
+      'plugins',
+      'cache',
+      'phone-a-friend-marketplace',
+      'phone-a-friend',
+      '2.6.3',
+      'skills',
+    );
+    for (const name of ['phone-a-friend', 'curiosity-engine', 'phone-a-team']) {
+      fs.mkdirSync(path.join(cacheRoot, name), { recursive: true });
+      fs.writeFileSync(path.join(cacheRoot, name, 'SKILL.md'), '# stub');
+    }
+    expect(isCodexInstalled(codexHome)).toBe(true);
+
+    // Removing one skill from the marketplace cache should make us fall
+    // back to "not installed" (no loose-file install present either).
+    fs.rmSync(path.join(cacheRoot, 'phone-a-friend', 'SKILL.md'));
+    expect(isCodexInstalled(codexHome)).toBe(false);
+  });
+
+  it('honors CODEX_HOME env var when codexHome not passed', () => {
+    const envHome = makeHome();
+    const prev = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = envHome;
+    try {
+      expect(codexConfigRoot()).toBe(envHome);
+      installHosts({
+        repoRoot: repo,
+        target: 'codex',
+        mode: 'symlink',
+        force: false,
+        syncClaudeCli: false,
+      syncCodexCli: false,
+      });
+      expect(fs.existsSync(path.join(envHome, 'skills', 'phone-a-friend', 'SKILL.md'))).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prev;
+      try { fs.rmSync(envHome, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('reinstall is idempotent (already-installed)', () => {
+    installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    expect(lines.some(l => l.includes('already-installed'))).toBe(true);
+  });
+
+  it('install does NOT ship paf-* subagent personas (legacy design dropped)', () => {
+    installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    for (const name of ['paf-reviewer', 'paf-critic', 'paf-synthesizer']) {
+      const target = path.join(codexHome, 'agents', `${name}.toml`);
+      expect(fs.existsSync(target)).toBe(false);
+    }
+  });
+
+  it('install cleans up legacy paf-* symlinks from a prior subagent install', () => {
+    // Simulate a stale install: drop paf-* symlinks pointing back into the
+    // current repo, as the prior installer version would have done.
+    const agentsDir = path.join(codexHome, 'agents');
+    fs.mkdirSync(agentsDir, { recursive: true });
+    // The current repo doesn't actually have agents/codex/paf-*.toml source
+    // files anymore (they were removed conceptually; physically the files
+    // still exist for now, so the symlink points at a real file). What
+    // matters for the cleanup logic is that the symlink resolves into the
+    // repo, which marks it PaF-owned.
+    const fakeSource = path.join(repo, 'agents', 'codex', 'paf-reviewer.toml');
+    fs.symlinkSync(fakeSource, path.join(agentsDir, 'paf-reviewer.toml'));
+
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    expect(fs.existsSync(path.join(agentsDir, 'paf-reviewer.toml'))).toBe(false);
+    expect(lines.some(l => l.includes('paf-reviewer') && l.includes('removed'))).toBe(true);
+  });
+
+  it('isCodexInstalled tracks skills only (no longer requires agents)', () => {
+    expect(isCodexInstalled(codexHome)).toBe(false);
+
+    installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+    expect(isCodexInstalled(codexHome)).toBe(true);
+
+    // Even with a non-existent legacy agents dir, install state is true
+    // because we no longer install paf-*.toml files.
+    expect(fs.existsSync(path.join(codexHome, 'agents'))).toBe(false);
+    expect(isCodexInstalled(codexHome)).toBe(true);
+  });
+
+  it('--no-codex-cli-sync skips the codex shell-out (no marketplace_add line)', () => {
+    // Mock `which codex` as success so the gate is the syncCodexCli flag,
+    // not binary presence. If syncCodexCli=false suppresses correctly, we
+    // should see no codex_cli_marketplace_add line.
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'which' && args[0] === 'codex') return '/usr/bin/codex';
+      // Anything else: treat as the real exec (shouldn't be called)
+      return '';
+    });
+
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    expect(lines.some(l => l.includes('codex_cli_marketplace_add'))).toBe(false);
+    expect(lines.some(l => l.includes('codex_cli_plugin_add'))).toBe(false);
+  });
+
+  it('syncCodexCli=true issues marketplace_add + plugin_add when codex binary present', () => {
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'which' && args[0] === 'codex') return '/usr/bin/codex';
+      if (cmd === 'codex') return 'ok';
+      return '';
+    });
+
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      // syncCodexCli defaults to true
+    });
+
+    expect(lines.some(l => l.includes('codex_cli_marketplace_add: ok'))).toBe(true);
+    expect(lines.some(l => l.includes('codex_cli_plugin_add: ok'))).toBe(true);
+
+    // Verify the actual shell-out commands issued
+    const codexCalls = mockExecFileSync.mock.calls
+      .filter((call: unknown[]) => call[0] === 'codex')
+      .map((call: unknown[]) => (call[1] as string[]).join(' '));
+    expect(codexCalls.some((s: string) => s.startsWith('plugin marketplace add '))).toBe(true);
+    expect(codexCalls.some((s: string) => s === 'plugin add phone-a-friend@phone-a-friend-marketplace')).toBe(true);
+  });
+
+  it('syncCodexCli=true reports skipped when codex binary not in PATH', () => {
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'which' && args[0] === 'codex') {
+        const err = new Error('not found') as NodeJS.ErrnoException & { status?: number };
+        err.status = 1;
+        throw err;
+      }
+      return '';
+    });
+
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+    });
+
+    expect(lines.some(l => l.includes('codex_cli: skipped'))).toBe(true);
+  });
+
+  it('codexCliUnsync=never skips the codex remove shell-out on uninstall', () => {
+    installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'which' && args[0] === 'codex') return '/usr/bin/codex';
+      return '';
+    });
+
+    const lines = uninstallHosts({
+      target: 'codex',
+      codexHome,
+      repoRoot: repo,
+      codexCliUnsync: 'never',
+    });
+
+    expect(lines.some(l => l.includes('codex_cli_unsync: skipped'))).toBe(true);
+    expect(lines.some(l => l.includes('codex_cli_plugin_remove'))).toBe(false);
+  });
+
+  it('uninstall fires codex plugin remove + marketplace remove when codex present', () => {
+    installHosts({
+      repoRoot: repo,
+      target: 'codex',
+      mode: 'symlink',
+      force: false,
+      codexHome,
+      syncClaudeCli: false,
+      syncCodexCli: false,
+    });
+
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'which' && args[0] === 'codex') return '/usr/bin/codex';
+      if (cmd === 'codex') return 'removed';
+      return '';
+    });
+
+    const lines = uninstallHosts({
+      target: 'codex',
+      codexHome,
+      repoRoot: repo,
+    });
+
+    expect(lines.some(l => l.includes('codex_cli_plugin_remove: ok'))).toBe(true);
+    expect(lines.some(l => l.includes('codex_cli_marketplace_remove: ok'))).toBe(true);
+  });
+
+  it('--all target installs Claude + OpenCode + Codex (with codex agents)', () => {
+    const claudeHome = makeHome();
+    const opencodeHome = makeHome();
+    const piHome = makeHome();
+    const grokHome = makeHome();
+    try {
+      const lines = installHosts({
+        repoRoot: repo,
+        target: 'all',
+        mode: 'symlink',
+        force: false,
+        claudeHome,
+        opencodeHome,
+        codexHome,
+        piHome,
+        grokHome,
+        syncClaudeCli: false,
+        syncCodexCli: false,
+      });
+
+      // Claude plugin dir
+      expect(fs.existsSync(path.join(claudeHome, 'plugins', 'phone-a-friend'))).toBe(true);
+      // OpenCode skills + commands
+      expect(fs.existsSync(opencodeSkillTarget('phone-a-friend', opencodeHome))).toBe(true);
+      // Codex skills (no subagents — paf-* design was dropped)
+      expect(fs.existsSync(codexSkillTarget('phone-a-team', codexHome))).toBe(true);
+      expect(fs.existsSync(path.join(codexHome, 'agents'))).toBe(false);
+
+      expect(lines.some(l => l.includes('codex_skill:phone-a-team'))).toBe(true);
+      expect(fs.existsSync(grokSkillTarget('phone-a-friend', grokHome))).toBe(true);
+      expect(fs.realpathSync(grokSkillTarget('phone-a-team', grokHome))).toBe(fs.realpathSync(path.join(repo, 'skills', 'phone-a-team', '.grok')));
+    } finally {
+      try { fs.rmSync(claudeHome, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(opencodeHome, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(piHome, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(grokHome, { recursive: true, force: true }); } catch {}
+    }
+  });
+});
+
+describe('pi host integration', () => {
+  let repo: string;
+  let piHome: string;
+  const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+  const install = (extra: Record<string, unknown> = {}) => installHosts({
+    repoRoot: repo,
+    target: 'pi',
+    mode: 'symlink',
+    force: false,
+    piHome,
+    syncClaudeCli: false,
+    syncCodexCli: false,
+    ...extra,
+  });
+
+  beforeEach(() => {
+    mockExecFileSync.mockReset();
+    repo = makeRepo();
+    piHome = makeHome();
+    delete process.env.PI_CODING_AGENT_DIR;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+    try { fs.rmSync(repo, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(piHome, { recursive: true, force: true }); } catch {}
+  });
+
+  describe('piAgentDir', () => {
+    it('defaults to ~/.pi/agent', () => {
+      expect(piAgentDir()).toBe(path.join(os.homedir(), '.pi', 'agent'));
+    });
+
+    it('honours PI_CODING_AGENT_DIR and expands a leading tilde the way pi does', () => {
+      process.env.PI_CODING_AGENT_DIR = '/opt/pi-agent';
+      expect(piAgentDir()).toBe('/opt/pi-agent');
+      process.env.PI_CODING_AGENT_DIR = '~/custom-agent';
+      expect(piAgentDir()).toBe(path.join(os.homedir(), 'custom-agent'));
+      process.env.PI_CODING_AGENT_DIR = '~';
+      expect(piAgentDir()).toBe(os.homedir());
+    });
+
+    it('mirrors pi on Windows: ~\\ expansion and shell drive paths', () => {
+      process.env.PI_CODING_AGENT_DIR = '~\\pi-agent';
+      expect(piAgentDir(undefined, 'win32')).toBe(path.win32.join(os.homedir(), 'pi-agent'));
+      process.env.PI_CODING_AGENT_DIR = '/c/Users/dev/pi-agent';
+      expect(piAgentDir(undefined, 'win32')).toBe('C:\\Users\\dev\\pi-agent');
+      // The same spellings are ordinary paths elsewhere.
+      expect(piAgentDir(undefined, 'linux')).toBe('/c/Users/dev/pi-agent');
+    });
+
+    it('accepts a file:// URL, as pi does', () => {
+      process.env.PI_CODING_AGENT_DIR = 'file:///opt/pi%20agent';
+      expect(piAgentDir(undefined, 'linux')).toBe('/opt/pi agent');
+    });
+
+    it('prefers an explicit directory over the environment', () => {
+      process.env.PI_CODING_AGENT_DIR = '/opt/pi-agent';
+      expect(piAgentDir(piHome)).toBe(piHome);
+      expect(piSkillTarget('phone-a-friend', piHome)).toBe(path.join(piHome, 'skills', 'phone-a-friend'));
+    });
+  });
+
+  it('symlinks the two shared skills into the agent skills directory', () => {
+    const lines = install();
+
+    for (const name of ['phone-a-friend', 'curiosity-engine']) {
+      const target = piSkillTarget(name, piHome);
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+      expect(fs.realpathSync(target)).toBe(fs.realpathSync(path.join(repo, 'skills', name)));
+      expect(lines).toContain(`- pi_skill:${name}: installed -> ${target}`);
+    }
+  });
+
+  it('installs the host-neutral skill, never the Codex overlay, and no phone-a-team', () => {
+    install();
+
+    expect(fs.existsSync(piSkillTarget('phone-a-team', piHome))).toBe(false);
+    expect(fs.readdirSync(path.join(piHome, 'skills')).sort()).toEqual(['curiosity-engine', 'phone-a-friend']);
+  });
+
+  it('writes no command shim: pi exposes skills as /skill:<name>', () => {
+    install();
+
+    expect(fs.readdirSync(piHome)).toEqual(['skills']);
+  });
+
+  it('touches no other host and shells out to nothing', () => {
+    const lines = install();
+
+    expect(mockExecFileSync).not.toHaveBeenCalled();
+    expect(lines.some(l => /claude|opencode|codex/.test(l))).toBe(false);
+  });
+
+  it('copies in copy mode', () => {
+    install({ mode: 'copy' });
+
+    const target = piSkillTarget('phone-a-friend', piHome);
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(false);
+    expect(fs.existsSync(path.join(target, 'SKILL.md'))).toBe(true);
+  });
+
+  it('is idempotent for an existing symlink to the same source', () => {
+    install();
+    const lines = install();
+
+    expect(lines.some(l => l.startsWith('- pi_skill:phone-a-friend: already-installed'))).toBe(true);
+  });
+
+  it('refuses to overwrite a skill it does not own unless forced', () => {
+    const target = piSkillTarget('phone-a-friend', piHome);
+    fs.mkdirSync(target, { recursive: true });
+    fs.writeFileSync(path.join(target, 'SKILL.md'), 'user authored');
+
+    expect(() => install()).toThrow(/Destination already exists/);
+    expect(fs.readFileSync(path.join(target, 'SKILL.md'), 'utf-8')).toBe('user authored');
+
+    install({ force: true });
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+  });
+
+  it('treats a symlink elsewhere into this repository as the user\'s, on install and on uninstall', () => {
+    const target = piSkillTarget('phone-a-friend', piHome);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.symlinkSync(path.join(repo, 'commands'), target);
+
+    expect(() => install()).toThrow(/Destination already exists/);
+    const lines = uninstallHosts({ target: 'pi', piHome, repoRoot: repo });
+
+    expect(lines).toContain('- pi_skill:phone-a-friend: kept (not PaF-owned; remove manually if desired)');
+    expect(fs.realpathSync(target)).toBe(fs.realpathSync(path.join(repo, 'commands')));
+  });
+
+  it('relinks a symlink from another PaF install location without --force', () => {
+    const other = makeTempDir('paf-other-install-');
+    const target = piSkillTarget('phone-a-friend', piHome);
+    try {
+      fs.mkdirSync(path.join(other, 'skills', 'phone-a-friend'), { recursive: true });
+      fs.writeFileSync(path.join(other, 'package.json'), JSON.stringify({ name: '@freibergergarcia/phone-a-friend' }));
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(path.join(other, 'skills', 'phone-a-friend'), target);
+
+      const lines = install();
+
+      expect(fs.realpathSync(target)).toBe(fs.realpathSync(path.join(repo, 'skills', 'phone-a-friend')));
+      expect(lines.some(l => l.startsWith('- pi_skill:phone-a-friend: installed'))).toBe(true);
+    } finally {
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it('uninstall removes a dangling symlink into this install', () => {
+    install();
+    fs.rmSync(path.join(repo, 'skills', 'phone-a-friend'), { recursive: true, force: true });
+
+    const lines = uninstallHosts({ target: 'pi', piHome, repoRoot: repo });
+
+    expect(lines).toContain('- pi_skill:phone-a-friend: removed');
+  });
+
+  it('fails when a skill source is missing', () => {
+    fs.rmSync(path.join(repo, 'skills', 'curiosity-engine'), { recursive: true, force: true });
+
+    expect(() => install()).toThrow(/Missing pi skill source/);
+  });
+
+  it('installs into PI_CODING_AGENT_DIR when no directory is passed', () => {
+    process.env.PI_CODING_AGENT_DIR = piHome;
+
+    installHosts({ repoRoot: repo, target: 'pi', syncClaudeCli: false, syncCodexCli: false });
+
+    expect(fs.existsSync(path.join(piHome, 'skills', 'phone-a-friend', 'SKILL.md'))).toBe(true);
+  });
+
+  it('uninstall removes the skills and reports what was not there', () => {
+    install();
+
+    const lines = uninstallHosts({ target: 'pi', piHome, repoRoot: repo });
+
+    expect(lines).toContain('- pi_skill:phone-a-friend: removed');
+    expect(lines).toContain('- pi_skill:curiosity-engine: removed');
+    expect(fs.existsSync(piSkillTarget('phone-a-friend', piHome))).toBe(false);
+    expect(mockExecFileSync).not.toHaveBeenCalled();
+
+    const again = uninstallHosts({ target: 'pi', piHome, repoRoot: repo });
+    expect(again).toContain('- pi_skill:phone-a-friend: not-installed');
+  });
+
+  it('uninstall keeps a skill directory PaF did not install', () => {
+    const target = piSkillTarget('phone-a-friend', piHome);
+    fs.mkdirSync(target, { recursive: true });
+    fs.writeFileSync(path.join(target, 'SKILL.md'), 'user authored');
+
+    const lines = uninstallHosts({ target: 'pi', piHome, repoRoot: repo });
+
+    expect(fs.readFileSync(path.join(target, 'SKILL.md'), 'utf-8')).toBe('user authored');
+    expect(lines).toContain('- pi_skill:phone-a-friend: kept (not PaF-owned; remove manually if desired)');
+    expect(lines).toContain('- pi_skill:curiosity-engine: not-installed');
+  });
+
+  it('uninstall keeps a symlink that points outside any PaF install', () => {
+    const elsewhere = makeTempDir('paf-elsewhere-');
+    const target = piSkillTarget('phone-a-friend', piHome);
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(elsewhere, target);
+
+      const lines = uninstallHosts({ target: 'pi', piHome, repoRoot: repo });
+
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+      expect(lines).toContain('- pi_skill:phone-a-friend: kept (not PaF-owned; remove manually if desired)');
+    } finally {
+      fs.rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  it('a copy install carries an ownership marker and is removed by uninstall, with or without a repo root', () => {
+    for (const repoRoot of [repo, undefined]) {
+      install({ mode: 'copy', force: true });
+      const target = piSkillTarget('phone-a-friend', piHome);
+      expect(fs.existsSync(path.join(target, '.phone-a-friend-install'))).toBe(true);
+      // The marker never lands in the source the copy was made from.
+      expect(fs.existsSync(path.join(repo, 'skills', 'phone-a-friend', '.phone-a-friend-install'))).toBe(false);
+
+      const lines = uninstallHosts({ target: 'pi', piHome, repoRoot });
+
+      expect(lines).toContain('- pi_skill:phone-a-friend: removed');
+      expect(fs.existsSync(target)).toBe(false);
+    }
+  });
+
+  describe('uninstall of a symlink into another install location', () => {
+    let other: string;
+    let otherSkill: string;
+    let target: string;
+
+    beforeEach(() => {
+      // Deliberately the conventional shape: <dir>/phone-a-friend/skills/phone-a-friend.
+      other = path.join(makeTempDir('paf-other-install-'), 'phone-a-friend');
+      otherSkill = path.join(other, 'skills', 'phone-a-friend');
+      fs.mkdirSync(otherSkill, { recursive: true });
+      target = piSkillTarget('phone-a-friend', piHome);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(otherSkill, target);
+    });
+
+    afterEach(() => {
+      fs.rmSync(path.dirname(other), { recursive: true, force: true });
+    });
+
+    it('removes it when that location is a PaF package', () => {
+      fs.writeFileSync(path.join(other, 'package.json'), JSON.stringify({ name: '@freibergergarcia/phone-a-friend' }));
+
+      const lines = uninstallHosts({ target: 'pi', piHome });
+
+      expect(lines).toContain('- pi_skill:phone-a-friend: removed');
+      expect(fs.existsSync(target)).toBe(false);
+      expect(fs.existsSync(otherSkill)).toBe(true);
+    });
+
+    it.each([
+      ['has no package.json', null],
+      ['is another package', { name: 'my-own-skills' }],
+      ['has a malformed package.json', '{ nope'],
+    ])('keeps it when that location %s, whatever the path looks like', (_label, manifest) => {
+      if (manifest !== null) {
+        fs.writeFileSync(path.join(other, 'package.json'), typeof manifest === 'string' ? manifest : JSON.stringify(manifest));
+      }
+
+      const lines = uninstallHosts({ target: 'pi', piHome, repoRoot: repo });
+
+      expect(lines).toContain('- pi_skill:phone-a-friend: kept (not PaF-owned; remove manually if desired)');
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+    });
+
+    it('keeps a dangling symlink: nothing is left to verify it against', () => {
+      fs.writeFileSync(path.join(other, 'package.json'), JSON.stringify({ name: '@freibergergarcia/phone-a-friend' }));
+      fs.rmSync(other, { recursive: true, force: true });
+
+      const lines = uninstallHosts({ target: 'pi', piHome });
+
+      expect(lines).toContain('- pi_skill:phone-a-friend: kept (not PaF-owned; remove manually if desired)');
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+    });
+  });
+
+  it('uninstall of a symlinked skill leaves the source in the repository alone', () => {
+    install();
+
+    uninstallHosts({ target: 'pi', piHome, repoRoot: repo });
+
+    expect(fs.existsSync(path.join(repo, 'skills', 'phone-a-friend', 'SKILL.md'))).toBe(true);
+  });
+
+  it('target=all uninstalls pi too', () => {
+    const claudeHome = makeHome();
+    const opencodeHome = makeHome();
+    const codexHome = makeHome();
+    const grokHome = makeHome();
+    try {
+      install();
+      const lines = uninstallHosts({
+        target: 'all', claudeHome, opencodeHome, codexHome, piHome, grokHome, repoRoot: repo,
+        claudeCliUnsync: 'never', codexCliUnsync: 'never',
+      });
+
+      expect(lines).toContain('- pi_skill:phone-a-friend: removed');
+    } finally {
+      for (const dir of [claudeHome, opencodeHome, codexHome, grokHome]) {
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      }
+    }
+  });
+
+  describe('isPiInstalled', () => {
+    const writeSettings = (value: unknown) => {
+      fs.mkdirSync(piHome, { recursive: true });
+      fs.writeFileSync(
+        path.join(piHome, 'settings.json'),
+        typeof value === 'string' ? value : JSON.stringify(value),
+      );
+    };
+
+    it('is false for an empty or missing agent directory', () => {
+      expect(isPiInstalled(piHome)).toBe(false);
+      expect(isPiInstalled(path.join(piHome, 'absent'))).toBe(false);
+    });
+
+    it('is true once both skills are installed, false when one is missing', () => {
+      install();
+      expect(isPiInstalled(piHome)).toBe(true);
+
+      fs.rmSync(piSkillTarget('curiosity-engine', piHome), { recursive: true, force: true });
+      expect(isPiInstalled(piHome)).toBe(false);
+    });
+
+    it('is false for a dangling symlink', () => {
+      install();
+      fs.rmSync(path.join(repo, 'skills'), { recursive: true, force: true });
+
+      expect(isPiInstalled(piHome)).toBe(false);
+    });
+
+    it('is true for a local package path that holds PaF, relative to the settings file', () => {
+      fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ name: '@freibergergarcia/phone-a-friend' }));
+      writeSettings({ packages: [path.relative(piHome, repo)] });
+      expect(isPiInstalled(piHome)).toBe(true);
+
+      writeSettings({ packages: [repo] });
+      expect(isPiInstalled(piHome)).toBe(true);
+
+      fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ name: 'something-else' }));
+      expect(isPiInstalled(piHome)).toBe(false);
+    });
+
+    it.each([
+      ['an npm source', ['npm:@freibergergarcia/phone-a-friend']],
+      ['a pinned npm source', ['npm:@freibergergarcia/phone-a-friend@4.11.0']],
+      ['the object form', [{ source: 'npm:@freibergergarcia/phone-a-friend', extensions: [] }]],
+      ['an npm spec with padding after the prefix, which pi trims', ['npm:  @freibergergarcia/phone-a-friend ']],
+    ])('is true for a PaF pi package declared as %s', (_label, packages) => {
+      writeSettings({ packages });
+
+      expect(isPiInstalled(piHome)).toBe(true);
+    });
+
+    // pi resolves git sources with hosted-git-info. PaF does not imitate that
+    // parser: a git-source package is a documented blind spot of the status,
+    // never a guess.
+    it.each([
+      'git:github.com/freibergergarcia/phone-a-friend@v4.11.0',
+      'git:git@github.com:freibergergarcia/phone-a-friend.git',
+      'git:github.com:freibergergarcia/phone-a-friend',
+      'https://github.com/freibergergarcia/phone-a-friend',
+      'https://github.com:443/freibergergarcia/phone-a-friend',
+      'https://github.com/freibergergarcia/phone-a-friend/tree/main',
+      'ssh://git@github.com/freibergergarcia/phone-a-friend',
+      'git:github.com/freibergergarcia/phone-a-friend/extra',
+      'git:github.com/freibergergarcia/phone-a-friend@',
+    ])('does not count the git source %s', (source) => {
+      writeSettings({ packages: [source] });
+
+      expect(isPiInstalled(piHome)).toBe(false);
+    });
+
+    it.each([
+      ['another package', { packages: ['npm:@example/pi-tools', 'npm:@freibergergarcia/phone-a-friend-extras'] }],
+      ['the object form with skills switched off', { packages: [{ source: 'npm:@freibergergarcia/phone-a-friend', skills: [] }] }],
+      ['a skills filter PaF does not evaluate', { packages: [{ source: 'npm:@freibergergarcia/phone-a-friend', skills: ['!**'] }] }],
+      ['autoload switched off', { packages: [{ source: 'npm:@freibergergarcia/phone-a-friend', autoload: false }] }],
+      ['a local path that does not exist', { packages: ['../nowhere/phone-a-friend'] }],
+      // pi dispatches on the untrimmed, case-sensitive prefix: these are local paths to pi.
+      ['a padded npm prefix', { packages: [' npm:@freibergergarcia/phone-a-friend'] }],
+      ['an upper-case protocol', { packages: ['HTTPS://github.com/freibergergarcia/phone-a-friend'] }],
+      ['an npm spec with a dangling @', { packages: ['npm:@freibergergarcia/phone-a-friend@'] }],
+      ['no packages', { quietStartup: true }],
+      ['packages of the wrong type', { packages: 'npm:@freibergergarcia/phone-a-friend' }],
+      ['malformed JSON', '{ not json'],
+    ])('is false for settings with %s', (_label, settings) => {
+      writeSettings(settings);
+
+      expect(isPiInstalled(piHome)).toBe(false);
+    });
+  });
+});
+
+describe('installFromGitHubMarketplace', () => {
+  beforeEach(() => {
+    mockExecFileSync.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('calls claude plugin commands with GitHub repo as source', () => {
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = installFromGitHubMarketplace();
+
+    // Verify marketplace add uses GitHub repo, not a local path
+    const marketplaceAddCall = mockExecFileSync.mock.calls.find(
+      (c: unknown[]) =>
+        c[0] === 'claude' &&
+        (c[1] as string[]).includes('marketplace') &&
+        (c[1] as string[]).includes('add'),
+    );
+    expect(marketplaceAddCall).toBeDefined();
+    expect((marketplaceAddCall![1] as string[])).toContain(GITHUB_REPO);
+    expect(lines.some(l => l.includes('marketplace_add: ok'))).toBe(true);
+  });
+
+  it('cleans up existing local symlink before marketplace registration', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-test-'));
+    const repo = makeRepo();
+    const pluginDir = path.join(tmpHome, 'plugins');
+    fs.mkdirSync(pluginDir, { recursive: true });
+    const target = path.join(pluginDir, PLUGIN_NAME);
+    fs.symlinkSync(repo, target);
+    expect(fs.existsSync(target)).toBe(true);
+
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    // Note: installFromGitHubMarketplace uses default homedir, not our temp.
+    // We test the uninstallHosts call is included in the output.
+    const lines = installFromGitHubMarketplace();
+    expect(lines.some(l => l.includes('uninstaller'))).toBe(true);
+
+    fs.rmSync(tmpHome, { recursive: true });
+    fs.rmSync(repo, { recursive: true });
+  });
+
+  it('succeeds even when no local symlink exists (idempotent)', () => {
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = installFromGitHubMarketplace();
+    // uninstallHosts reports not-installed, but no error
+    expect(lines.some(l => l.includes('not-installed') || l.includes('marketplace_add: ok'))).toBe(true);
+  });
+
+  it('exports GITHUB_REPO constant', () => {
+    expect(GITHUB_REPO).toBe('freibergergarcia/phone-a-friend');
+  });
+});
+
+describe('getMarketplaceSourceType', () => {
+  it('returns source type for remote marketplace (github)', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-test-'));
+    const pluginsDir = path.join(tmpHome, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        [MARKETPLACE_NAME]: {
+          source: { source: 'github', repo: 'freibergergarcia/phone-a-friend' },
+        },
+      }),
+    );
+    expect(getMarketplaceSourceType(MARKETPLACE_NAME, tmpHome)).toBe('github');
+    fs.rmSync(tmpHome, { recursive: true });
+  });
+
+  it('returns null for local directory marketplace', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-test-'));
+    const pluginsDir = path.join(tmpHome, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        [MARKETPLACE_NAME]: {
+          source: { source: 'directory', path: '/some/local/path' },
+        },
+      }),
+    );
+    expect(getMarketplaceSourceType(MARKETPLACE_NAME, tmpHome)).toBeNull();
+    fs.rmSync(tmpHome, { recursive: true });
+  });
+
+  it('returns null when marketplace is not registered', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-test-'));
+    const pluginsDir = path.join(tmpHome, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({}),
+    );
+    expect(getMarketplaceSourceType(MARKETPLACE_NAME, tmpHome)).toBeNull();
+    fs.rmSync(tmpHome, { recursive: true });
+  });
+
+  it('returns null when registry file does not exist', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-test-'));
+    expect(getMarketplaceSourceType(MARKETPLACE_NAME, tmpHome)).toBeNull();
+    fs.rmSync(tmpHome, { recursive: true });
+  });
+});
+
+describe('uninstallHosts marketplace unsync guard', () => {
+  let repo: string;
+  let claudeHome: string;
+
+  beforeEach(() => {
+    mockExecFileSync.mockReset();
+    repo = makeRepo();
+    claudeHome = makeHome();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    try { fs.rmSync(repo, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(claudeHome, { recursive: true, force: true }); } catch {}
+  });
+
+  it('auto mode skips unsync when marketplace has remote source', () => {
+    const pluginsDir = path.join(claudeHome, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        [MARKETPLACE_NAME]: {
+          source: { source: 'github', repo: 'freibergergarcia/phone-a-friend' },
+        },
+      }),
+    );
+
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = uninstallHosts({ target: 'claude', claudeHome });
+
+    expect(lines.some(l => l.includes('skipped') && l.includes('github'))).toBe(true);
+    expect(lines.some(l => l.includes('--purge-marketplace'))).toBe(true);
+    // Should NOT have called claude plugin disable/uninstall/marketplace remove
+    const claudeCalls = mockExecFileSync.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'claude',
+    );
+    expect(claudeCalls.length).toBe(0);
+  });
+
+  it('auto mode proceeds when marketplace has directory source', () => {
+    const pluginsDir = path.join(claudeHome, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        [MARKETPLACE_NAME]: {
+          source: { source: 'directory', path: '/some/local/path' },
+        },
+      }),
+    );
+
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = uninstallHosts({ target: 'claude', claudeHome });
+
+    expect(lines.some(l => l.includes('disable: ok') || l.includes('marketplace_remove: ok'))).toBe(true);
+  });
+
+  it('auto mode proceeds when registry does not exist', () => {
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = uninstallHosts({ target: 'claude', claudeHome });
+
+    // No remote source detected, so unsync proceeds
+    const claudeCalls = mockExecFileSync.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'claude',
+    );
+    expect(claudeCalls.length).toBeGreaterThan(0);
+  });
+
+  it('always mode unsyncs even with remote source', () => {
+    const pluginsDir = path.join(claudeHome, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        [MARKETPLACE_NAME]: {
+          source: { source: 'github', repo: 'freibergergarcia/phone-a-friend' },
+        },
+      }),
+    );
+
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = uninstallHosts({
+      target: 'claude',
+      claudeHome,
+      claudeCliUnsync: 'always',
+    });
+
+    // Should have called claude commands despite remote source
+    const claudeCalls = mockExecFileSync.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'claude',
+    );
+    expect(claudeCalls.length).toBeGreaterThan(0);
+    expect(lines.some(l => l.includes('marketplace_remove: ok'))).toBe(true);
+  });
+
+  it('never mode skips unsync entirely', () => {
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = uninstallHosts({
+      target: 'claude',
+      claudeHome,
+      claudeCliUnsync: 'never',
+    });
+
+    expect(lines.some(l => l.includes('claude_cli_unsync: skipped'))).toBe(true);
+    const claudeCalls = mockExecFileSync.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'claude',
+    );
+    expect(claudeCalls.length).toBe(0);
+  });
+});
+
+describe('installHosts marketplace sync guard', () => {
+  let repo: string;
+  let claudeHome: string;
+
+  beforeEach(() => {
+    mockExecFileSync.mockReset();
+    repo = makeRepo();
+    claudeHome = makeHome();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    try { fs.rmSync(repo, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(claudeHome, { recursive: true, force: true }); } catch {}
+  });
+
+  it('skips sync when marketplace has remote source', () => {
+    // Set up a remote marketplace registration
+    const pluginsDir = path.join(claudeHome, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        [MARKETPLACE_NAME]: {
+          source: { source: 'github', repo: 'freibergergarcia/phone-a-friend' },
+        },
+      }),
+    );
+
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: false,
+      claudeHome,
+      syncClaudeCli: true,
+    });
+
+    expect(lines.some(l => l.includes('claude_cli_sync: skipped') && l.includes('GitHub freibergergarcia/phone-a-friend'))).toBe(true);
+    expect(lines.some(l => l.includes('--force-marketplace-sync'))).toBe(true);
+    // Should NOT have called claude plugin marketplace add
+    const marketplaceAddCalls = mockExecFileSync.mock.calls.filter(
+      (c: unknown[]) =>
+        c[0] === 'claude' &&
+        (c[1] as string[]).includes('marketplace') &&
+        (c[1] as string[]).includes('add'),
+    );
+    expect(marketplaceAddCalls.length).toBe(0);
+  });
+
+  it('allows sync when forceMarketplaceSync is true', () => {
+    const pluginsDir = path.join(claudeHome, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        [MARKETPLACE_NAME]: {
+          source: { source: 'github', repo: 'freibergergarcia/phone-a-friend' },
+        },
+      }),
+    );
+
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: false,
+      claudeHome,
+      syncClaudeCli: true,
+      forceMarketplaceSync: true,
+    });
+
+    expect(lines.some(l => l.includes('marketplace_add: ok'))).toBe(true);
+  });
+
+  it('syncs normally when the marketplace is registered from this checkout', () => {
+    const pluginsDir = path.join(claudeHome, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        [MARKETPLACE_NAME]: {
+          source: { source: 'directory', path: repo },
+        },
+      }),
+    );
+
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      return '';
+    });
+
+    const lines = installHosts({
+      repoRoot: repo,
+      target: 'claude',
+      mode: 'symlink',
+      force: false,
+      claudeHome,
+      syncClaudeCli: true,
+    });
+
+    expect(lines.some(l => l.includes('marketplace_add: ok'))).toBe(true);
+  });
+});
+
+describe('codexMarketplaceSource', () => {
+  it('passes a clean local path through unchanged (local-dev symlink case)', () => {
+    const local = '/Users/dev/code/phone-a-friend';
+    expect(codexMarketplaceSource(local)).toBe(local);
+  });
+
+  it('falls back to the GitHub slug for an npm-scoped path containing @', () => {
+    // Codex parses the source as owner/repo[@ref], so the @ in an npm scope
+    // (e.g. a global install) is misread as a git ref delimiter and rejected.
+    const scoped = '/opt/homebrew/lib/node_modules/@freibergergarcia/phone-a-friend';
+    expect(codexMarketplaceSource(scoped)).toBe(GITHUB_REPO);
+  });
+
+  it('uses the slug for any @-containing path, regardless of scope name', () => {
+    expect(codexMarketplaceSource('/some/@anyscope/pkg')).toBe(GITHUB_REPO);
+  });
+});
+
+describe('codex marketplace_add source selection (npm-scoped install)', () => {
+  beforeEach(() => {
+    mockExecFileSync.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('never passes an @-containing path to codex plugin marketplace add', () => {
+    // Build a structurally-valid repo at a path containing @, mimicking an
+    // npm-scoped global install (.../@freibergergarcia/phone-a-friend).
+    const scopedRepo = makeRepo('phone-a-friend-@freibergergarcia-');
+    const codexHome = makeTempDir('paf-codexhome-');
+    try {
+      mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === 'which' && args[0] === 'codex') return '/usr/bin/codex';
+        if (cmd === 'codex') return 'ok';
+        return '';
+      });
+
+      installHosts({
+        repoRoot: scopedRepo,
+        target: 'codex',
+        mode: 'symlink',
+        force: false,
+        codexHome,
+        syncClaudeCli: false,
+      });
+
+      const marketplaceAddCall = mockExecFileSync.mock.calls.find(
+        (c: unknown[]) =>
+          c[0] === 'codex' &&
+          (c[1] as string[]).includes('marketplace') &&
+          (c[1] as string[]).includes('add'),
+      );
+      expect(marketplaceAddCall).toBeDefined();
+      const source = (marketplaceAddCall![1] as string[]).at(-1) as string;
+      expect(source.includes('@')).toBe(false);
+      expect(source).toBe(GITHUB_REPO);
+    } finally {
+      try { fs.rmSync(scopedRepo, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(codexHome, { recursive: true, force: true }); } catch {}
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stale Claude marketplace registrations
+// ---------------------------------------------------------------------------
+
+describe('Claude marketplace source and stale registrations', () => {
+  let root: string;
+  let claudeHome: string;
+  let pafHome: string;
+
+  /** An npm-style global install of PaF under `<root>/<prefix>/lib/node_modules`. */
+  function makeNpmInstall(prefix: string): string {
+    const dir = path.join(root, prefix, 'lib', 'node_modules', '@freibergergarcia', 'phone-a-friend');
+    fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), '{"name":"phone-a-friend"}');
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"@freibergergarcia/phone-a-friend"}');
+    return dir;
+  }
+
+  function register(source: Record<string, string>): void {
+    fs.mkdirSync(path.join(claudeHome, 'plugins'), { recursive: true });
+    fs.writeFileSync(
+      path.join(claudeHome, 'plugins', 'known_marketplaces.json'),
+      JSON.stringify({ [MARKETPLACE_NAME]: { source } }),
+    );
+  }
+
+  function recordInstalls(plugins: Record<string, unknown[]>): void {
+    fs.mkdirSync(path.join(claudeHome, 'plugins'), { recursive: true });
+    fs.writeFileSync(
+      path.join(claudeHome, 'plugins', 'installed_plugins.json'),
+      JSON.stringify({ version: 2, plugins }),
+    );
+  }
+
+  function claudeCalls(): { args: string[]; cwd?: string }[] {
+    return mockExecFileSync.mock.calls
+      .filter((c: unknown[]) => c[0] === 'claude')
+      .map((c: unknown[]) => ({ args: c[1] as string[], cwd: (c[2] as { cwd?: string } | undefined)?.cwd }));
+  }
+
+  function removesOurs(args: string[]): boolean {
+    return args.join(' ') === `plugin marketplace remove ${MARKETPLACE_NAME}`;
+  }
+
+  function isAdd(args: string[]): boolean {
+    return args[1] === 'marketplace' && args[2] === 'add';
+  }
+
+  function syncFrom(repoRoot: string, extra: Partial<Parameters<typeof installHosts>[0]> = {}): string[] {
+    return installHosts({ repoRoot, target: 'claude', claudeHome, pafHome, ...extra });
+  }
+
+  beforeEach(() => {
+    mockExecFileSync.mockReset();
+    mockExecFileSync.mockImplementation((cmd: string) => (cmd === 'which' ? '/usr/local/bin/claude' : ''));
+    root = makeTempDir('paf-marketplace-');
+    claudeHome = path.join(root, 'claude-home');
+    pafHome = path.join(root, 'paf-home');
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('claudeConfigRoot prefers an explicit home, then CLAUDE_CONFIG_DIR', () => {
+    expect(claudeConfigRoot('/explicit')).toBe('/explicit');
+    vi.stubEnv('CLAUDE_CONFIG_DIR', '/profile');
+    expect(claudeConfigRoot()).toBe('/profile');
+    expect(claudeTarget()).toBe(path.join('/profile', 'plugins', PLUGIN_NAME));
+  });
+
+  it('reads the registry under CLAUDE_CONFIG_DIR when no home is passed', () => {
+    vi.stubEnv('CLAUDE_CONFIG_DIR', claudeHome);
+    register({ source: 'github', repo: GITHUB_REPO });
+    expect(getMarketplaceSourceType()).toBe('github');
+  });
+
+  it('registers an npm install from GitHub and a checkout from its folder', () => {
+    expect(claudeMarketplaceSource(makeNpmInstall('node24'))).toEqual({ kind: 'github', repo: GITHUB_REPO });
+    const checkout = makeRepo();
+    expect(claudeMarketplaceSource(checkout)).toEqual({ kind: 'directory', path: checkout });
+    fs.rmSync(checkout, { recursive: true, force: true });
+  });
+
+  it('a fresh npm install adds the GitHub marketplace and records it', () => {
+    syncFrom(makeNpmInstall('node24'));
+    const add = claudeCalls().find(c => isAdd(c.args));
+    expect(add?.args).toContain(GITHUB_REPO);
+    const record = JSON.parse(fs.readFileSync(path.join(pafHome, 'claude-marketplace.json'), 'utf-8'));
+    expect(record.source).toEqual({ kind: 'github', repo: GITHUB_REPO });
+  });
+
+  it('an npm install already registered from GitHub syncs without repointing', () => {
+    register({ source: 'github', repo: GITHUB_REPO });
+    const lines = syncFrom(makeNpmInstall('node24'));
+    expect(claudeCalls().some(c => removesOurs(c.args))).toBe(false);
+    expect(lines.some(l => l.includes('claude_cli_update: ok'))).toBe(true);
+  });
+
+  it('updates every installed paf-tasks panel, each project from its own folder', () => {
+    const project = path.join(root, 'some-project');
+    fs.mkdirSync(project);
+    register({ source: 'github', repo: GITHUB_REPO });
+    recordInstalls({
+      [`paf-tasks@${MARKETPLACE_NAME}`]: [
+        { scope: 'user' },
+        { scope: 'project', projectPath: project },
+        { scope: 'project', projectPath: path.join(root, 'gone') },
+      ],
+    });
+
+    const lines = syncFrom(makeNpmInstall('node24'));
+
+    const calls = claudeCalls();
+    expect(calls).toContainEqual({ args: ['plugin', 'update', `paf-tasks@${MARKETPLACE_NAME}`, '-s', 'user'], cwd: undefined });
+    expect(calls).toContainEqual({ args: ['plugin', 'update', `paf-tasks@${MARKETPLACE_NAME}`, '-s', 'project'], cwd: project });
+    expect(lines).toContain('- claude_cli_update:paf-tasks (user): ok');
+    expect(lines.some(l => l.includes('paf-tasks (project') && l.includes('skipped (project folder not found)'))).toBe(true);
+    // The panel updates after the marketplace refresh, so it sees the new catalog.
+    const refresh = calls.findIndex(c => c.args.join(' ') === `plugin marketplace update ${MARKETPLACE_NAME}`);
+    const panel = calls.findIndex(c => c.args.join(' ') === `plugin update paf-tasks@${MARKETPLACE_NAME} -s user`);
+    expect(panel).toBeGreaterThan(refresh);
+  });
+
+  it('does not update paf-tasks when it is not installed', () => {
+    register({ source: 'github', repo: GITHUB_REPO });
+    syncFrom(makeNpmInstall('node24'));
+    expect(claudeCalls().some(c => c.args.includes(`paf-tasks@${MARKETPLACE_NAME}`))).toBe(false);
+  });
+
+  it('reports a failed paf-tasks update with its output', () => {
+    register({ source: 'github', repo: GITHUB_REPO });
+    recordInstalls({ [`paf-tasks@${MARKETPLACE_NAME}`]: [{ scope: 'user' }] });
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      if (cmd === 'claude' && args[1] === 'update' && args[2] === `paf-tasks@${MARKETPLACE_NAME}`) {
+        throw Object.assign(new Error('update failed'), { status: 1, stdout: '', stderr: 'network down' });
+      }
+      return '';
+    });
+
+    const lines = syncFrom(makeNpmInstall('node24'));
+
+    expect(lines).toContain('- claude_cli_update:paf-tasks (user): failed');
+    expect(lines).toContain('  output: network down');
+  });
+
+  it('repoints a registration left by a previous Node version and reinstalls every plugin it had', () => {
+    const old = makeNpmInstall('node22');
+    const project = path.join(root, 'some-project');
+    fs.mkdirSync(project);
+    register({ source: 'directory', path: old });
+    recordInstalls({
+      [`${PLUGIN_NAME}@${MARKETPLACE_NAME}`]: [{ scope: 'user' }, { scope: 'project', projectPath: project }],
+      [`paf-tasks@${MARKETPLACE_NAME}`]: [{ scope: 'user' }],
+    });
+
+    const lines = syncFrom(makeNpmInstall('node24'));
+
+    const calls = claudeCalls();
+    const removeIndex = calls.findIndex(c => c.args.join(' ') === `plugin marketplace remove ${MARKETPLACE_NAME}`);
+    const addIndex = calls.findIndex(c => isAdd(c.args) && c.args.includes(GITHUB_REPO));
+    expect(removeIndex).toBeGreaterThanOrEqual(0);
+    expect(addIndex).toBeGreaterThan(removeIndex);
+    expect(calls).toContainEqual({ args: ['plugin', 'install', `paf-tasks@${MARKETPLACE_NAME}`, '-s', 'user'], cwd: undefined });
+    expect(calls).toContainEqual({ args: ['plugin', 'install', `${PLUGIN_NAME}@${MARKETPLACE_NAME}`, '-s', 'project'], cwd: project });
+    expect(lines.some(l => l.includes('marketplace_repoint') && l.includes(old))).toBe(true);
+    // Restored installs come after the regular user-scope install of phone-a-friend.
+    const userInstall = calls.findIndex(c => c.args.join(' ') === `plugin install ${PLUGIN_NAME}@${MARKETPLACE_NAME} -s user`);
+    const panelInstall = calls.findIndex(c => c.args.join(' ') === `plugin install paf-tasks@${MARKETPLACE_NAME} -s user`);
+    expect(userInstall).toBeGreaterThan(addIndex);
+    expect(panelInstall).toBeGreaterThan(userInstall);
+    // A panel the repoint just reinstalled is current; no separate update.
+    expect(calls.some(c => c.args.join(' ') === `plugin update paf-tasks@${MARKETPLACE_NAME} -s user`)).toBe(false);
+  });
+
+  it('repoints a registration of this very install folder (pre-GitHub npm registration)', () => {
+    const current = makeNpmInstall('node24');
+    register({ source: 'directory', path: current });
+    syncFrom(current);
+    expect(claudeCalls().some(c => isAdd(c.args) && c.args.includes(GITHUB_REPO))).toBe(true);
+  });
+
+  it('leaves a checkout registration alone and says how to switch', () => {
+    const checkout = makeRepo();
+    register({ source: 'directory', path: checkout });
+    const lines = syncFrom(makeNpmInstall('node24'));
+    expect(claudeCalls()).toEqual([]);
+    expect(lines.some(l => l.includes('claude_cli_sync: skipped') && l.includes(checkout))).toBe(true);
+    expect(lines.some(l => l.includes('--force-marketplace-sync'))).toBe(true);
+    expect(fs.existsSync(path.join(pafHome, 'claude-marketplace.json'))).toBe(false);
+    fs.rmSync(checkout, { recursive: true, force: true });
+  });
+
+  it('names a registered folder that no longer exists', () => {
+    register({ source: 'directory', path: path.join(root, 'gone') });
+    const lines = syncFrom(makeNpmInstall('node24'));
+    expect(lines.some(l => l.includes('that folder no longer exists'))).toBe(true);
+    expect(claudeCalls()).toEqual([]);
+  });
+
+  it('--force-marketplace-sync repoints a registration PaF cannot prove it made', () => {
+    register({ source: 'directory', path: path.join(root, 'gone') });
+    syncFrom(makeNpmInstall('node24'), { forceMarketplaceSync: true });
+    expect(claudeCalls().some(c => removesOurs(c.args))).toBe(true);
+    expect(claudeCalls().some(c => isAdd(c.args) && c.args.includes(GITHUB_REPO))).toBe(true);
+  });
+
+  it('restores the previous folder when the new source cannot be added', () => {
+    const old = makeNpmInstall('node22');
+    register({ source: 'directory', path: old });
+    recordInstalls({ [`paf-tasks@${MARKETPLACE_NAME}`]: [{ scope: 'user' }] });
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'which') return '/usr/local/bin/claude';
+      if (cmd === 'claude' && args[2] === 'add' && args[3] === GITHUB_REPO) {
+        throw Object.assign(new Error('clone failed'), { status: 1, stderr: 'git clone failed' });
+      }
+      return '';
+    });
+
+    const lines = syncFrom(makeNpmInstall('node24'));
+
+    expect(claudeCalls().some(c => isAdd(c.args) && c.args.includes(old))).toBe(true);
+    expect(lines.some(l => l.includes('marketplace_restore: ok'))).toBe(true);
+    expect(claudeCalls()).toContainEqual({ args: ['plugin', 'install', `paf-tasks@${MARKETPLACE_NAME}`, '-s', 'user'], cwd: undefined });
+    expect(fs.existsSync(path.join(pafHome, 'claude-marketplace.json'))).toBe(false);
+  });
+
+  it('plugin install --github repoints a folder registration', () => {
+    register({ source: 'directory', path: makeRepo() });
+    installFromGitHubMarketplace({ claudeHome, pafHome });
+    expect(claudeCalls().some(c => removesOurs(c.args))).toBe(true);
+    expect(claudeCalls().some(c => isAdd(c.args) && c.args.includes(GITHUB_REPO))).toBe(true);
+  });
+
+  it('uninstall removes a GitHub marketplace PaF registered, and keeps one the user added', () => {
+    register({ source: 'github', repo: GITHUB_REPO });
+    const kept = uninstallHosts({ target: 'claude', claudeHome, pafHome });
+    expect(kept.some(l => l.includes('claude_cli_unsync: skipped'))).toBe(true);
+
+    syncFrom(makeNpmInstall('node24'));
+    mockExecFileSync.mockClear();
+    const removed = uninstallHosts({ target: 'claude', claudeHome, pafHome });
+    expect(removed.some(l => l.includes('marketplace_remove: ok'))).toBe(true);
+    expect(fs.existsSync(path.join(pafHome, 'claude-marketplace.json'))).toBe(false);
+  });
+
+  it('claudeMarketplaceStatus reports a stale, missing registration', () => {
+    register({ source: 'directory', path: path.join(root, 'gone') });
+    const status = claudeMarketplaceStatus(makeNpmInstall('node24'), claudeHome);
+    expect(status).toMatchObject({ matches: false, missingPath: true, pafOwned: false });
+    expect(status.expected).toEqual({ kind: 'github', repo: GITHUB_REPO });
+  });
+});
+
+describe('grok host integration', () => {
+  let repo: string;
+  let grokHome: string;
+
+  const install = (extra: Record<string, unknown> = {}) => installHosts({
+    repoRoot: repo,
+    target: 'grok',
+    mode: 'symlink',
+    force: false,
+    grokHome,
+    syncClaudeCli: false,
+    syncCodexCli: false,
+    ...extra,
+  });
+
+  beforeEach(() => {
+    mockExecFileSync.mockReset();
+    repo = makeRepo();
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ name: '@freibergergarcia/phone-a-friend' }));
+    grokHome = makeHome();
+  });
+
+  afterEach(() => {
+    try { fs.rmSync(repo, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(grokHome, { recursive: true, force: true }); } catch {}
+  });
+
+  it('defaults the skill root to ~/.grok', () => {
+    expect(grokConfigRoot()).toBe(path.join(os.homedir(), '.grok'));
+    expect(grokSkillTarget('phone-a-friend', grokHome)).toBe(path.join(grokHome, 'skills', 'phone-a-friend'));
+  });
+
+  it('symlinks the two shared skills and the Grok phone-a-team overlay', () => {
+    const lines = install();
+
+    for (const name of ['phone-a-friend', 'curiosity-engine']) {
+      const target = grokSkillTarget(name, grokHome);
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+      expect(fs.realpathSync(target)).toBe(fs.realpathSync(path.join(repo, 'skills', name)));
+      expect(lines).toContain(`- grok_skill:${name}: installed -> ${target}`);
+    }
+    expect(fs.realpathSync(grokSkillTarget('phone-a-team', grokHome))).toBe(fs.realpathSync(path.join(repo, 'skills', 'phone-a-team', '.grok')));
+    expect(isGrokInstalled(grokHome)).toBe(true);
+  });
+
+  it('writes the ownership marker on a copy install', () => {
+    install({ mode: 'copy' });
+    const target = grokSkillTarget('phone-a-friend', grokHome);
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(path.join(target, '.phone-a-friend-install'), 'utf8')).toContain('@freibergergarcia/phone-a-friend');
+    expect(isGrokInstalled(grokHome)).toBe(true);
+  });
+
+  it('is false when only one skill is present, or when the skills are not PaF-owned', () => {
+    expect(isGrokInstalled(grokHome)).toBe(false);
+    install();
+    fs.rmSync(grokSkillTarget('curiosity-engine', grokHome), { recursive: true, force: true });
+    expect(isGrokInstalled(grokHome)).toBe(false);
+
+    const user = grokSkillTarget('phone-a-friend', grokHome);
+    fs.rmSync(user, { recursive: true, force: true });
+    fs.mkdirSync(user, { recursive: true });
+    fs.writeFileSync(path.join(user, 'SKILL.md'), '# mine\n');
+    fs.mkdirSync(grokSkillTarget('curiosity-engine', grokHome), { recursive: true });
+    fs.writeFileSync(path.join(grokSkillTarget('curiosity-engine', grokHome), 'SKILL.md'), '# mine\n');
+    expect(isGrokInstalled(grokHome)).toBe(false);
+  });
+
+  it('uninstall removes a PaF-owned skill and keeps a skill the user wrote', () => {
+    install();
+    const lines = uninstallHosts({ target: 'grok', grokHome, repoRoot: repo });
+    expect(lines).toContain('- grok_skill:phone-a-friend: removed');
+    expect(lines).toContain('- grok_skill:curiosity-engine: removed');
+    expect(fs.existsSync(grokSkillTarget('phone-a-friend', grokHome))).toBe(false);
+    expect(fs.existsSync(path.join(repo, 'skills', 'phone-a-friend', 'SKILL.md'))).toBe(true);
+
+    const user = grokSkillTarget('phone-a-friend', grokHome);
+    fs.mkdirSync(user, { recursive: true });
+    fs.writeFileSync(path.join(user, 'SKILL.md'), '# mine\n');
+    const kept = uninstallHosts({ target: 'grok', grokHome, repoRoot: repo });
+    expect(kept).toContain('- grok_skill:phone-a-friend: kept (not PaF-owned; remove manually if desired)');
+    expect(fs.existsSync(path.join(user, 'SKILL.md'))).toBe(true);
+  });
+
+  it.each(['.grok', '.codex'])('recognizes and relinks a %s overlay from another PaF checkout', (overlay) => {
+    const previous = makeRepo();
+    fs.writeFileSync(path.join(previous, 'package.json'), JSON.stringify({ name: '@freibergergarcia/phone-a-friend' }));
+    try {
+      install();
+      const target = grokSkillTarget('phone-a-team', grokHome);
+      fs.unlinkSync(target);
+      fs.symlinkSync(path.join(previous, 'skills', 'phone-a-team', overlay), target);
+      expect(isGrokInstalled(grokHome)).toBe(true);
+      install();
+      expect(fs.realpathSync(target)).toBe(fs.realpathSync(path.join(repo, 'skills', 'phone-a-team', '.grok')));
+      fs.unlinkSync(target);
+      fs.symlinkSync(path.join(previous, 'skills', 'phone-a-team', overlay), target);
+      expect(uninstallHosts({ target: 'grok', grokHome, repoRoot: repo })).toContain('- grok_skill:phone-a-team: removed');
+      expect(fs.existsSync(path.join(previous, 'skills', 'phone-a-team', overlay, 'SKILL.md'))).toBe(true);
+    } finally {
+      fs.rmSync(previous, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps an overlay link in a non-PaF package', () => {
+    const other = makeRepo();
+    try {
+      install();
+      const target = grokSkillTarget('phone-a-team', grokHome);
+      fs.unlinkSync(target);
+      fs.symlinkSync(path.join(other, 'skills', 'phone-a-team', '.grok'), target);
+      expect(isGrokInstalled(grokHome)).toBe(false);
+      expect(uninstallHosts({ target: 'grok', grokHome, repoRoot: repo })).toContain('- grok_skill:phone-a-team: kept (not PaF-owned; remove manually if desired)');
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+    } finally {
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a dangling symlink', () => {
+    install();
+    const other = makeTempDir('grok-other-');
+    const target = grokSkillTarget('phone-a-friend', grokHome);
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.mkdirSync(path.join(other, 'skills'), { recursive: true });
+    fs.symlinkSync(path.join(other, 'skills', 'phone-a-friend'), target);
+    fs.rmSync(other, { recursive: true, force: true });
+
+    const lines = uninstallHosts({ target: 'grok', grokHome, repoRoot: repo });
+    expect(lines).toContain('- grok_skill:phone-a-friend: kept (not PaF-owned; remove manually if desired)');
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+  });
+});

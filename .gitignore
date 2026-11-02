@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.claude/
+.venv/
+.env
+.env.*
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+plans/
+node_modules/
+*.tsbuildinfo
+artifacts/
+# Written by Claude Code when it loads a plugin folder (mods/<name>/.claude-plugin/types/)
+.claude-plugin/types/

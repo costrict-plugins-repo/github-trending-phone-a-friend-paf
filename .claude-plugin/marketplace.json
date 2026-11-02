@@ -1,0 +1,25 @@
+{
+  "name": "phone-a-friend-marketplace",
+  "owner": {
+    "name": "Bruno Freiberger"
+  },
+  "metadata": {
+    "description": "Plugins for AI agent collaboration via phone-a-friend"
+  },
+  "plugins": [
+    {
+      "name": "phone-a-friend",
+      "description": "Get second opinions and code reviews from other coding backends in Claude Code. Requires the phone-a-friend CLI and separately configured backends.",
+      "source": {
+        "source": "npm",
+        "package": "@freibergergarcia/phone-a-friend"
+      }
+    },
+    {
+      "name": "paf-tasks",
+      "displayName": "Phone a Friend panel",
+      "description": "A Claude Code mod: every phone-a-friend review as a thread of rounds with its verdict and findings, live progress while a reviewer works. Needs Claude Code 2.1.287+ and the phone-a-friend CLI 4.5.0+ on PATH.",
+      "source": "./mods/paf-tasks"
+    }
+  ]
+}
